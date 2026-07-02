@@ -2,6 +2,7 @@ import win32com.client
 import time  
 import os  
 import csv
+import re
 from datetime import datetime  
 import pytz  
 import logging  
@@ -34,9 +35,13 @@ class EmailProcessor:
         with open(self.csv_log_file, mode='a', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_id, sender, subject, report_generated])
+
+    def clean_subject(self, subject):
+        """Removes common email reply/forward prefixes to extract just the application code."""
+        cleaned = re.sub(r'^(?i)(re|fw|fwd)\s*:\s*', '', subject)
+        return cleaned.strip()
   
     def filter_and_save_report(self, report_config, application_code):  
-        """Processes multiple sections and saves them into a single HTML report, even if empty."""
         report_name = report_config['report_name']
         sections = report_config['sections']
         
@@ -66,6 +71,9 @@ class EmailProcessor:
         '''  
 
         try:
+            # We enforce exact matching for the application code
+            clean_app_code = application_code.lower()
+
             for index, section in enumerate(sections):
                 section_title = section['title']
                 app_column = section['app_column']
@@ -86,22 +94,28 @@ class EmailProcessor:
                 df = pd.concat(df_list, ignore_index=True)
 
                 if app_column in df.columns:  
-                    # 1. Filter by Application Code
-                    filtered_df = df[df[app_column].str.contains(application_code, case=False, na=False)]  
-        
-                    # 2. Filter by Status (Keep 'Open' OR anything containing 'Exception')
-                    if 'Status' in filtered_df.columns:
-                        clean_status = filtered_df['Status'].astype(str).str.strip().str.lower()
-                        filtered_df = filtered_df[
+                    # STEP 1: Verify the Application Code actually exists in this file (Exact Match)
+                    base_filtered_df = df[df[app_column].astype(str).str.strip().str.lower() == clean_app_code]
+                    
+                    if base_filtered_df.empty:
+                        # Application code does not exist in this section's tracker at all. Skip entirely.
+                        continue
+
+                    # STEP 2: The code exists. Now filter for 'Open' or 'Exception' statuses.
+                    if 'Status' in base_filtered_df.columns:
+                        clean_status = base_filtered_df['Status'].astype(str).str.strip().str.lower()
+                        status_filtered_df = base_filtered_df[
                             (clean_status == 'open') | (clean_status.str.contains('exception', na=False))
                         ]
+                    else:
+                        status_filtered_df = base_filtered_df
                         
-                    if not filtered_df.empty:  
+                    if not status_filtered_df.empty:  
                         if columns_to_extract:
-                            valid_columns = [col for col in columns_to_extract if col in filtered_df.columns]
-                            result = filtered_df[valid_columns]  
+                            valid_columns = [col for col in columns_to_extract if col in status_filtered_df.columns]
+                            result = status_filtered_df[valid_columns]  
                         else:
-                            result = filtered_df
+                            result = status_filtered_df
 
                         status_col_index = -1
                         dropdown_html = ""
@@ -124,7 +138,7 @@ class EmailProcessor:
                         section_html = f"<h3>{section_title}</h3>\n{dropdown_html}\n{table_html}\n<hr>"
                         html_sections.append(section_html)
                     else:
-                        # SUCCESS STATE: No open/exception findings for this section
+                        # SUCCESS STATE: App code exists in tracker, but has ZERO open/exception findings.
                         empty_state_html = f'''
                         <h3>{section_title}</h3>
                         <p style="padding: 12px; background-color: #e8f5e9; border-left: 5px solid #4caf50; font-family: Arial, sans-serif; color: #2e7d32;">
@@ -136,7 +150,7 @@ class EmailProcessor:
                 else:
                     logging.warning(f"'{app_column}' missing in {section_title} source files.")
             
-            # Always generate HTML report as long as we processed sections
+            # Generate HTML ONLY if at least one section contained the Application Code
             if html_sections:
                 current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  
                 output_dir = r'C:\Python\Application\CCB'
@@ -169,6 +183,7 @@ class EmailProcessor:
                 logging.info(f"{report_name} saved successfully: {output_html_path}")  
                 return output_html_path 
 
+            # Return None if the app code wasn't found in this report's trackers
             return None
 
         except Exception as e:
@@ -228,12 +243,14 @@ class EmailProcessor:
 
                 if message_dt < self.startup_time:
                     continue
-
-                application_code = message.Subject 
+                
+                # Extract clean application code (removes "RE: ", "FW: ", etc.)
+                raw_subject = message.Subject
+                application_code = self.clean_subject(raw_subject)
                 sender_email = self.get_sender_smtp_address(message)
 
                 if application_code:
-                    logging.info(f"Processing new request for: {application_code} from {sender_email}")  
+                    logging.info(f"Processing new request for subject: '{raw_subject}' (Extracted Code: '{application_code}') from {sender_email}")  
                     
                     reports = [  
                         {
@@ -308,6 +325,7 @@ class EmailProcessor:
                         if attachment_path:
                             generated_attachments.append(attachment_path)
 
+                    # Only send an email if the Application Code was actually found in the files
                     if generated_attachments:
                         self.send_email_with_attachments( 
                             to_email=sender_email, 
@@ -315,8 +333,10 @@ class EmailProcessor:
                             body=f"Hello,\n\nPlease find the requested security reports for {application_code} attached.\n\nNote: Only findings with an 'Open' or 'Exception' related status are included. If an assessment returns zero such findings, the report will explicitly indicate that it is clear.\n\nRegards,\nInfosec Team",
                             attachment_paths=generated_attachments
                         ) 
+                    else:
+                        logging.info(f"Subject '{raw_subject}' did not match any application codes in our records. No email sent.")
                     
-                    self.log_to_csv(entry_id, sender_email, application_code, bool(generated_attachments))
+                    self.log_to_csv(entry_id, sender_email, raw_subject, bool(generated_attachments))
 
                 message.UnRead = False
                 self.processed_entry_ids.add(entry_id)
