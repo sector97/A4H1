@@ -36,12 +36,11 @@ class EmailProcessor:
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_id, sender, subject, report_generated])
   
     def filter_and_save_report(self, report_config, application_code):  
-        """Processes multiple sections and saves them into a single HTML report."""
+        """Processes multiple sections and saves them into a single HTML report, even if empty."""
         report_name = report_config['report_name']
         sections = report_config['sections']
         
         html_sections = []
-        has_any_data = False
 
         global_javascript = '''  
         <script>  
@@ -93,14 +92,11 @@ class EmailProcessor:
                     # 2. Filter by Status (Only keep 'Open' and 'Exception Approved')
                     if 'Status' in filtered_df.columns:
                         allowed_statuses = ['open', 'exception approved']
-                        # Convert to lowercase and strip whitespace for robust matching
                         filtered_df = filtered_df[
                             filtered_df['Status'].astype(str).str.strip().str.lower().isin(allowed_statuses)
                         ]
                         
                     if not filtered_df.empty:  
-                        has_any_data = True
-                        
                         if columns_to_extract:
                             valid_columns = [col for col in columns_to_extract if col in filtered_df.columns]
                             result = filtered_df[valid_columns]  
@@ -112,7 +108,6 @@ class EmailProcessor:
                         
                         if 'Status' in result.columns:
                             status_col_index = result.columns.get_loc('Status')
-                            # Because we already filtered above, options will only be 'Open' and/or 'Exception Approved'
                             status_options = result['Status'].dropna().unique().tolist()  
                             
                             dropdown_id = f"statusDropdown_{index}"
@@ -126,15 +121,23 @@ class EmailProcessor:
                             dropdown_html += '</select><br><br>'  
         
                         table_html = result.to_html(index=False, table_id=f"resultTable_{index}")  
-                        
                         section_html = f"<h3>{section_title}</h3>\n{dropdown_html}\n{table_html}\n<hr>"
                         html_sections.append(section_html)
                     else:
-                        html_sections.append(f"<h3>{section_title}</h3>\n<p>No Open or Exception Approved records found for {application_code}.</p>\n<hr>")
+                        # SUCCESS STATE: No open findings for this section
+                        empty_state_html = f'''
+                        <h3>{section_title}</h3>
+                        <p style="padding: 12px; background-color: #e8f5e9; border-left: 5px solid #4caf50; font-family: Arial, sans-serif; color: #2e7d32;">
+                            <b>There are no Open or Exception Approved points under respective activity ({report_name}).</b>
+                        </p>
+                        <hr>
+                        '''
+                        html_sections.append(empty_state_html)
                 else:
                     logging.warning(f"'{app_column}' missing in {section_title} source files.")
             
-            if has_any_data:
+            # Always generate HTML report as long as we processed sections
+            if html_sections:
                 current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  
                 output_dir = r'C:\Python\Application\CCB'
                 os.makedirs(output_dir, exist_ok=True)
@@ -165,9 +168,8 @@ class EmailProcessor:
 
                 logging.info(f"{report_name} saved successfully: {output_html_path}")  
                 return output_html_path 
-            else:
-                logging.info(f"No Open or Exception Approved records found across any sections for '{application_code}' in {report_name}.")
-                return None
+
+            return None
 
         except Exception as e:
             logging.error(f"Error generating {report_name} for {application_code}: {e}")
@@ -310,7 +312,7 @@ class EmailProcessor:
                         self.send_email_with_attachments( 
                             to_email=sender_email, 
                             subject=f"RE: {application_code} - Requested Reports", 
-                            body=f"Hello,\n\nPlease find the requested security reports for {application_code} attached.\nNote: Only findings with an 'Open' or 'Exception Approved' status are included.\n\nRegards,\nInfosec Team",
+                            body=f"Hello,\n\nPlease find the requested security reports for {application_code} attached.\n\nNote: If an assessment returns zero findings, the report will explicitly indicate that there are no Open or Exception Approved points.\n\nRegards,\nInfosec Team",
                             attachment_paths=generated_attachments
                         ) 
                     
