@@ -42,8 +42,8 @@ class EmailProcessor:
         It will reject subjects containing RE:, FW:, or any other text.
         """
         clean_sub = subject.strip()
-        # ^ asserts start of string, (?i) makes CRI case-insensitive, \d+ matches digits, $ asserts end of string
-        match = re.match(r'^(?i)CRI\d+$', clean_sub)
+        # FIXED: (?i) is now at the absolute start of the regex string
+        match = re.match(r'(?i)^CRI\d+$', clean_sub)
         if match:
             return clean_sub.upper()
         return None
@@ -305,7 +305,7 @@ class EmailProcessor:
                 
                 raw_subject = message.Subject
                 
-                # Check for strict CRIXXXXX code match
+                # Check for strict CRIXXXXX code match (ignores RE:, FW:, etc.)
                 application_code = self.extract_app_code(raw_subject)
                 sender_email = self.get_sender_smtp_address(message)
 
