@@ -42,7 +42,6 @@ class EmailProcessor:
         It will reject subjects containing RE:, FW:, or any other text.
         """
         clean_sub = subject.strip()
-        # FIXED: (?i) is now at the absolute start of the regex string
         match = re.match(r'(?i)^CRI\d+$', clean_sub)
         if match:
             return clean_sub.upper()
@@ -57,6 +56,8 @@ class EmailProcessor:
         
         html_sections = []
         found_app_name = None
+        # Track if the app code is found in ANY file for this report (prevents blank reports)
+        app_exists_in_report = False 
 
         global_javascript = '''  
         <script>  
@@ -150,68 +151,85 @@ class EmailProcessor:
                 if app_column in df.columns:  
                     base_filtered_df = df[df[app_column].astype(str).str.strip().str.lower() == clean_app_code]
                     
-                    if base_filtered_df.empty:
-                        continue
+                    if not base_filtered_df.empty:
+                        # Mark that this code genuinely exists in our scope
+                        app_exists_in_report = True
 
-                    if not found_app_name and 'Application Name' in base_filtered_df.columns:
-                        names = base_filtered_df['Application Name'].dropna()
-                        if not names.empty:
-                            found_app_name = str(names.iloc[0]).strip()
+                        if not found_app_name and 'Application Name' in base_filtered_df.columns:
+                            names = base_filtered_df['Application Name'].dropna()
+                            if not names.empty:
+                                found_app_name = str(names.iloc[0]).strip()
 
-                    if 'Status' in base_filtered_df.columns:
-                        clean_status = base_filtered_df['Status'].astype(str).str.strip().str.lower()
-                        status_filtered_df = base_filtered_df[
-                            (clean_status == 'open') | (clean_status.str.contains('exception', na=False))
-                        ]
-                    else:
-                        status_filtered_df = base_filtered_df
-                        
-                    if not status_filtered_df.empty:  
-                        if columns_to_extract:
-                            valid_columns = [col for col in columns_to_extract if col in status_filtered_df.columns]
-                            result = status_filtered_df[valid_columns]  
+                        if 'Status' in base_filtered_df.columns:
+                            clean_status = base_filtered_df['Status'].astype(str).str.strip().str.lower()
+                            status_filtered_df = base_filtered_df[
+                                (clean_status == 'open') | (clean_status.str.contains('exception', na=False))
+                            ]
                         else:
-                            result = status_filtered_df
+                            status_filtered_df = base_filtered_df
+                            
+                        if not status_filtered_df.empty:  
+                            if columns_to_extract:
+                                valid_columns = [col for col in columns_to_extract if col in status_filtered_df.columns]
+                                result = status_filtered_df[valid_columns]  
+                            else:
+                                result = status_filtered_df
 
-                        status_col_index = -1
-                        dropdown_html = ""
-                        
-                        if 'Status' in result.columns:
-                            status_col_index = result.columns.get_loc('Status')
-                            status_options = result['Status'].dropna().unique().tolist()  
+                            status_col_index = -1
+                            dropdown_html = ""
                             
-                            dropdown_id = f"statusDropdown_{index}"
-                            table_id = f"resultTable_{index}"
-                            
-                            dropdown_html = f'<label for="{dropdown_id}">Filter by Status: </label>'
-                            dropdown_html += f'<select id="{dropdown_id}" onchange="filterTable(\'{dropdown_id}\', \'{table_id}\', {status_col_index})">'  
-                            dropdown_html += '<option value="All">All</option>'  
-                            for status in status_options:  
-                                dropdown_html += f'<option value="{status}">{status}</option>'  
-                            dropdown_html += '</select><br>'  
-        
-                        table_html = result.to_html(index=False, table_id=f"resultTable_{index}")  
-                        section_html = f"<h3>{section_title}</h3>\n{dropdown_html}\n{custom_note_html}\n{table_html}\n<hr>"
-                        html_sections.append(section_html)
+                            if 'Status' in result.columns:
+                                status_col_index = result.columns.get_loc('Status')
+                                status_options = result['Status'].dropna().unique().tolist()  
+                                
+                                dropdown_id = f"statusDropdown_{index}"
+                                table_id = f"resultTable_{index}"
+                                
+                                dropdown_html = f'<label for="{dropdown_id}">Filter by Status: </label>'
+                                dropdown_html += f'<select id="{dropdown_id}" onchange="filterTable(\'{dropdown_id}\', \'{table_id}\', {status_col_index})">'  
+                                dropdown_html += '<option value="All">All</option>'  
+                                for status in status_options:  
+                                    dropdown_html += f'<option value="{status}">{status}</option>'  
+                                dropdown_html += '</select><br>'  
+            
+                            table_html = result.to_html(index=False, table_id=f"resultTable_{index}")  
+                            section_html = f"<h3>{section_title}</h3>\n{dropdown_html}\n{custom_note_html}\n{table_html}\n<hr>"
+                            html_sections.append(section_html)
+                        else:
+                            # App code exists in file, but ZERO open findings
+                            if report_name == "SCA" and section_title in ["Security", "Violations"]:
+                                empty_msg = f"<b>There are no Open Security or Violation Issue under SCA - {application_code}.</b>"
+                            else:
+                                empty_msg = f"<b>There are no Open or Exception-related points under the respective activity ({report_name}).</b>"
+
+                            empty_state_html = f'''
+                            <h3>{section_title}</h3>
+                            {custom_note_html}
+                            <p style="padding: 12px; background-color: #e8f5e9; border-left: 5px solid #4caf50; font-family: Arial, sans-serif; color: #2e7d32;">
+                                {empty_msg}
+                            </p>
+                            <hr>
+                            '''
+                            html_sections.append(empty_state_html)
                     else:
+                        # NEW ENHANCEMENT: App code DOES NOT exist in this specific file at all.
+                        # We only inject a message for SCA Security and Violations.
                         if report_name == "SCA" and section_title in ["Security", "Violations"]:
-                            empty_msg = f"<b>There are no Open Security or Violation Issue under SCA - {application_code}.</b>"
-                        else:
-                            empty_msg = f"<b>There are no Open or Exception-related points under the respective activity ({report_name}).</b>"
-
-                        empty_state_html = f'''
-                        <h3>{section_title}</h3>
-                        {custom_note_html}
-                        <p style="padding: 12px; background-color: #e8f5e9; border-left: 5px solid #4caf50; font-family: Arial, sans-serif; color: #2e7d32;">
-                            {empty_msg}
-                        </p>
-                        <hr>
-                        '''
-                        html_sections.append(empty_state_html)
+                            empty_msg = f"<b>There are no security violations that have been observed.</b>"
+                            empty_state_html = f'''
+                            <h3>{section_title}</h3>
+                            {custom_note_html}
+                            <p style="padding: 12px; background-color: #e8f5e9; border-left: 5px solid #4caf50; font-family: Arial, sans-serif; color: #2e7d32;">
+                                {empty_msg}
+                            </p>
+                            <hr>
+                            '''
+                            html_sections.append(empty_state_html)
                 else:
                     logging.warning(f"'{app_column}' missing in {section_title} source files.")
             
-            if html_sections:
+            # Generate HTML ONLY if the app code actually existed in at least one file for this report.
+            if html_sections and app_exists_in_report:
                 current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  
                 output_dir = r'C:\Python\Application\CCB'
                 os.makedirs(output_dir, exist_ok=True)
@@ -415,11 +433,9 @@ class EmailProcessor:
                         self.log_to_csv(entry_id, sender_email, raw_subject, False, "Out of Scope")
 
                 else:
-                    # IGNORING INVALID SUBJECTS (RE:, conversational, etc.)
                     logging.info(f"Ignored email with subject '{raw_subject}' as it does not strictly match the exact 'CRIXXXXX' format.")
                     self.log_to_csv(entry_id, sender_email, raw_subject, False, "Ignored - Invalid Subject Format")
 
-                # Always mark as read to prevent endless loops
                 message.UnRead = False
                 self.processed_entry_ids.add(entry_id)
 
