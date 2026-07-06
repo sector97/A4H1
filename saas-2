@@ -29,17 +29,20 @@ class EmailProcessor:
         if not os.path.exists(self.csv_log_file):
             with open(self.csv_log_file, mode='w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file)
-                writer.writerow(["Timestamp", "EntryID", "SenderEmail", "Subject", "ReportGenerated"])
+                writer.writerow(["Timestamp", "EntryID", "SenderEmail", "Subject", "ReportGenerated", "Status"])
 
-    def log_to_csv(self, entry_id, sender, subject, report_generated):
+    def log_to_csv(self, entry_id, sender, subject, report_generated, status="Processed"):
         with open(self.csv_log_file, mode='a', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_id, sender, subject, report_generated])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_id, sender, subject, report_generated, status])
 
-    def clean_subject(self, subject):
-        """Removes common email reply/forward prefixes to extract just the application code."""
-        cleaned = re.sub(r'(?i)^(re|fw|fwd)\s*:\s*', '', subject)
-        return cleaned.strip()
+    def extract_app_code(self, subject):
+        """Extracts the application code starting with 'CRI' followed by numbers."""
+        # Regex looks for 'CRI' (case-insensitive) followed immediately by digits
+        match = re.search(r'(?i)(CRI\d+)', subject)
+        if match:
+            return match.group(1).upper()
+        return None
   
     def filter_and_save_report(self, report_config, application_code):  
         """
@@ -119,7 +122,6 @@ class EmailProcessor:
                 app_column = section['app_column']
                 columns_to_extract = section.get('columns_to_extract', [])
                 
-                # Determine Custom Notes for SCA sections
                 custom_note_html = ""
                 if report_name == "SCA":
                     if section_title == "SLA Tracker":
@@ -298,11 +300,13 @@ class EmailProcessor:
                     continue
                 
                 raw_subject = message.Subject
-                application_code = self.clean_subject(raw_subject)
+                
+                # Extract valid CRI code
+                application_code = self.extract_app_code(raw_subject)
                 sender_email = self.get_sender_smtp_address(message)
 
                 if application_code:
-                    logging.info(f"Processing new request for subject: '{raw_subject}' (Extracted Code: '{application_code}') from {sender_email}")  
+                    logging.info(f"Processing request for extracted Code: '{application_code}' from {sender_email}")  
                     
                     reports = [  
                         {
@@ -325,7 +329,7 @@ class EmailProcessor:
                                 {
                                     "title": "SAST Data",
                                     "sources": [
-                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SAST\SAST Updated Tracker.xlsx', "sheet_name": "Tracker"}
+                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\ SAST\SAST Updated Tracker.xlsx', "sheet_name": "Tracker"}
                                     ],
                                     "header_row": 0,  
                                     "app_column": 'Application Code',
@@ -339,8 +343,8 @@ class EmailProcessor:
                                 {
                                     "title": "SLA Tracker",
                                     "sources": [
-                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2025"},
-                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2026"}
+                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\ SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2025"},
+                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\ SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2026"}
                                     ],
                                     "header_row": 0,  
                                     "app_column": 'Application Code',
@@ -380,6 +384,7 @@ class EmailProcessor:
                         if extracted_name and not global_app_name:
                             global_app_name = extracted_name
 
+                    # Logic Tree: Success vs. Out of Scope
                     if generated_attachments:
                         if global_app_name:
                             email_subject = f"RE: {application_code} - {global_app_name} - Requested Reports"
@@ -392,10 +397,20 @@ class EmailProcessor:
                             body=f"Hello,\n\nPlease find the requested security reports for {application_code} attached.\n\nNote: Only findings with an 'Open' or 'Exception' related status are included. If an assessment returns zero such findings, the report will explicitly indicate that it is clear.\n\nRegards,\nInfosec Team",
                             attachment_paths=generated_attachments
                         ) 
+                        self.log_to_csv(entry_id, sender_email, raw_subject, True, "Success")
                     else:
-                        logging.info(f"Subject '{raw_subject}' did not match any application codes in our records. No email sent.")
-                    
-                    self.log_to_csv(entry_id, sender_email, raw_subject, bool(generated_attachments))
+                        # OUT OF SCOPE EVENT: App code matched 'CRI...' but zero records found across all sheets
+                        logging.info(f"Code '{application_code}' not found in any trackers. Triggering Out of Scope email.")
+                        email_subject = f"RE: {application_code} - Application Not in Scope"
+                        body = f"Hello,\n\nThe mentioned application code ({application_code}) is not present in any of the activities (VAPT, SAST & SCA). Application might not be in the Scope. Kindly reach out to Infosec_VAPT.\n\nRegards,\nInfosec Team"
+                        
+                        self.send_email_with_attachments(
+                            to_email=sender_email, 
+                            subject=email_subject, 
+                            body=body,
+                            attachment_paths=[] # Send without attachments
+                        )
+                        self.log_to_csv(entry_id, sender_email, raw_subject, False, "Out of Scope")
 
                 message.UnRead = False
                 self.processed_entry_ids.add(entry_id)
