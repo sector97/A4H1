@@ -37,11 +37,15 @@ class EmailProcessor:
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_id, sender, subject, report_generated, status])
 
     def extract_app_code(self, subject):
-        """Extracts the application code starting with 'CRI' followed by numbers."""
-        # Regex looks for 'CRI' (case-insensitive) followed immediately by digits
-        match = re.search(r'(?i)(CRI\d+)', subject)
+        """
+        Extracts the application code ONLY if the subject is EXACTLY 'CRI' followed by numbers.
+        It will reject subjects containing RE:, FW:, or any other text.
+        """
+        clean_sub = subject.strip()
+        # ^ asserts start of string, (?i) makes CRI case-insensitive, \d+ matches digits, $ asserts end of string
+        match = re.match(r'^(?i)CRI\d+$', clean_sub)
         if match:
-            return match.group(1).upper()
+            return clean_sub.upper()
         return None
   
     def filter_and_save_report(self, report_config, application_code):  
@@ -301,12 +305,12 @@ class EmailProcessor:
                 
                 raw_subject = message.Subject
                 
-                # Extract valid CRI code
+                # Check for strict CRIXXXXX code match
                 application_code = self.extract_app_code(raw_subject)
                 sender_email = self.get_sender_smtp_address(message)
 
                 if application_code:
-                    logging.info(f"Processing request for extracted Code: '{application_code}' from {sender_email}")  
+                    logging.info(f"Processing request for strictly formatted Code: '{application_code}' from {sender_email}")  
                     
                     reports = [  
                         {
@@ -384,7 +388,6 @@ class EmailProcessor:
                         if extracted_name and not global_app_name:
                             global_app_name = extracted_name
 
-                    # Logic Tree: Success vs. Out of Scope
                     if generated_attachments:
                         if global_app_name:
                             email_subject = f"RE: {application_code} - {global_app_name} - Requested Reports"
@@ -399,7 +402,6 @@ class EmailProcessor:
                         ) 
                         self.log_to_csv(entry_id, sender_email, raw_subject, True, "Success")
                     else:
-                        # OUT OF SCOPE EVENT: App code matched 'CRI...' but zero records found across all sheets
                         logging.info(f"Code '{application_code}' not found in any trackers. Triggering Out of Scope email.")
                         email_subject = f"RE: {application_code} - Application Not in Scope"
                         body = f"Hello,\n\nThe mentioned application code ({application_code}) is not present in any of the activities (VAPT, SAST & SCA). Application might not be in the Scope. Kindly reach out to Infosec_VAPT.\n\nRegards,\nInfosec Team"
@@ -408,10 +410,16 @@ class EmailProcessor:
                             to_email=sender_email, 
                             subject=email_subject, 
                             body=body,
-                            attachment_paths=[] # Send without attachments
+                            attachment_paths=[]
                         )
                         self.log_to_csv(entry_id, sender_email, raw_subject, False, "Out of Scope")
 
+                else:
+                    # IGNORING INVALID SUBJECTS (RE:, conversational, etc.)
+                    logging.info(f"Ignored email with subject '{raw_subject}' as it does not strictly match the exact 'CRIXXXXX' format.")
+                    self.log_to_csv(entry_id, sender_email, raw_subject, False, "Ignored - Invalid Subject Format")
+
+                # Always mark as read to prevent endless loops
                 message.UnRead = False
                 self.processed_entry_ids.add(entry_id)
 
