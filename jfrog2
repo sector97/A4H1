@@ -31,9 +31,8 @@ class EmailProcessor:
         self.csv_log_file = "processed_emails_log.csv"
         self._initialize_csv_log()
         
-        # JFrog Configuration
-        self.jfrog_base_url = "https://lower-artifactory.crisil.local"
-        self.jfrog_user = "abhimanyue"
+        # JFrog Credentials
+        self.jfrog_user = "c-abhimanyue"
         self.jfrog_pass = "1234"
 
     def _initialize_csv_log(self):
@@ -66,12 +65,11 @@ class EmailProcessor:
             return utc_time_str
 
     def generate_xray_report(self, mail_text, application_code):
-        """Extracts JFrog URLs from email body, fetches API data, and builds HTML report."""
-        # Fix Outlook HTML encoding
+        """Extracts JFrog URLs (standard and ue1), authenticates dynamically, and builds HTML report."""
         mail_text = mail_text.replace("&amp;", "&")
         
-        # Extract unique URLs safely avoiding HTML tags/quotes
-        urls = re.findall(r"https://lower-artifactory\.crisil\.local[^\s<>\"']+", mail_text)
+        # Updated Regex to capture both lower-artifactory and ue1-lower-artifactory
+        urls = re.findall(r"(?i)https://(?:ue1-)?lower-artifactory\.crisil\.local[^\s<>\"']+", mail_text)
         urls = list(dict.fromkeys(urls))
         
         if not urls:
@@ -87,15 +85,20 @@ class EmailProcessor:
             "X-Requested-With": "XMLHttpRequest"
         }
 
+        # Identify unique base URLs present in the extracted links
+        base_urls = set(f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in urls)
+
+        # Log into each unique base URL dynamically
         try:
-            login_response = session.post(
-                f"{self.jfrog_base_url}/ui/api/v1/access/auth/login?_spring_security_remember_me=false",
-                headers=common_headers,
-                json={"username": self.jfrog_user, "password": self.jfrog_pass}
-            )
-            if login_response.status_code != 200:
-                logging.error(f"JFrog Login Failed: {login_response.status_code}")
-                return None
+            for base in base_urls:
+                login_response = session.post(
+                    f"{base}/ui/api/v1/access/auth/login?_spring_security_remember_me=false",
+                    headers=common_headers,
+                    json={"username": self.jfrog_user, "password": self.jfrog_pass}
+                )
+                if login_response.status_code != 200:
+                    logging.error(f"JFrog Login Failed for {base}: {login_response.status_code}")
+                    return None
         except Exception as e:
             logging.error(f"JFrog Connection Error: {e}")
             return None
@@ -105,6 +108,7 @@ class EmailProcessor:
         for jfrog_url in urls:
             try:
                 parsed = urlparse(jfrog_url)
+                current_base_url = f"{parsed.scheme}://{parsed.netloc}"
                 params = parse_qs(parsed.query)
 
                 package_id = unquote(params.get("package_id", [""])[0])
@@ -118,9 +122,9 @@ class EmailProcessor:
                 path_tokens = artifact_path.split("/")
                 service_name = path_tokens[5] if len(path_tokens) > 5 else artifact_path
 
-                # Policy API
+                # Policy API (routed to the correct base URL)
                 policy_payload = {"package_id": package_id, "path": path, "version": version}
-                policy_resp = session.post(f"{self.jfrog_base_url}/ui/api/v1/xray/ui/userIssues/dashboard/policyViolations", headers=common_headers, json=policy_payload)
+                policy_resp = session.post(f"{current_base_url}/ui/api/v1/xray/ui/userIssues/dashboard/policyViolations", headers=common_headers, json=policy_payload)
                 policy_severity = policy_resp.json().get("severity_count", {}) if policy_resp.status_code == 200 else {}
 
                 # Vulnerability API
@@ -129,11 +133,11 @@ class EmailProcessor:
                     "multiScanId": "", "scanType": "repositories", "isGitRepoMultiscan": False,
                     "issue_kind": 0, "isGitRepo": False
                 }
-                vuln_resp = session.post(f"{self.jfrog_base_url}/ui/api/v1/xray/ui/component/dashboard/vulnerabilities", headers=common_headers, json=vuln_payload)
+                vuln_resp = session.post(f"{current_base_url}/ui/api/v1/xray/ui/component/dashboard/vulnerabilities", headers=common_headers, json=vuln_payload)
                 vuln_severity = vuln_resp.json().get("severity_count", {}) if vuln_resp.status_code == 200 else {}
 
                 # Artifact Status
-                artifact_resp = session.post(f"{self.jfrog_base_url}/ui/api/v1/xray/ui/unified/artifact/status", headers=common_headers, json={"path": artifact_path, "repo": repo})
+                artifact_resp = session.post(f"{current_base_url}/ui/api/v1/xray/ui/unified/artifact/status", headers=common_headers, json={"path": artifact_path, "repo": repo})
                 artifact_json = artifact_resp.json() if artifact_resp.status_code == 200 else {}
                 
                 sca = artifact_json.get("details", {}).get("sca", {})
@@ -512,14 +516,12 @@ class EmailProcessor:
                 if application_code:
                     logging.info(f"Processing request for Code: '{application_code}' from {sender_email}")  
                     
-                    # 1. Fetch JFrog Xray Report dynamically from email body contents
                     mail_body_text = message.Body
                     if hasattr(message, "HTMLBody"):
                         mail_body_text += " \n " + str(message.HTMLBody)
                         
                     xray_html_path = self.generate_xray_report(mail_body_text, application_code)
 
-                    # 2. Excel Configurations (VAPT, SAST, SCA)
                     reports = [  
                         {
                             "report_name": "Application VAPT",
@@ -541,7 +543,7 @@ class EmailProcessor:
                                 {
                                     "title": "SAST Data",
                                     "sources": [
-                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SAST\SAST Updated Tracker.xlsx', "sheet_name": "Tracker"}
+                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\ SAST\SAST Updated Tracker.xlsx', "sheet_name": "Tracker"}
                                     ],
                                     "header_row": 0,  
                                     "app_column": 'Application Code',
@@ -555,8 +557,8 @@ class EmailProcessor:
                                 {
                                     "title": "SLA Tracker",
                                     "sources": [
-                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2025"},
-                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2026"}
+                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\ SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2025"},
+                                        {"file_path": r'C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\ SCA\Automation\Dashboard_v3.xlsx', "sheet_name": "SLA Tracker 2026"}
                                     ],
                                     "header_row": 0,  
                                     "app_column": 'Application Code',
@@ -590,7 +592,6 @@ class EmailProcessor:
                     global_app_name = None
                     app_found_in_any_report = False
                     
-                    # Attach Xray report if successfully generated
                     if xray_html_path:
                         generated_attachments.append(xray_html_path)
                         app_found_in_any_report = True
@@ -633,7 +634,6 @@ class EmailProcessor:
                         )
                         self.log_to_csv(entry_id, sender_email, raw_subject, False, "Out of Scope")
                         
-                        # Cleanup temp blanks
                         for path in generated_attachments:
                             try:
                                 if os.path.exists(path):
