@@ -3,15 +3,19 @@ import re
 import zipfile
 import requests
 import pandas as pd
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 USERNAME = "c-abhimanyue"
 PASSWORD = "1234"
 
-# Dictionary to cache sessions for different artifactory base URLs
-SESSIONS = {}
+# List all supported Artifactory base URLs here
+ARTIFACTORY_BASES = [
+    "https://lower-artifactory.crisil.local",
+    "https://ue1-lower-artifactory.crisil.local",
+]
 
 requests.packages.urllib3.disable_warnings()
+
 
 def extract_url(user_input):
     user_input = str(user_input).strip()
@@ -20,10 +24,6 @@ def extract_url(user_input):
         return match.group(1)
     return user_input
 
-def get_base_url(jar_url):
-    """Dynamically extract the Artifactory base URL from the provided link."""
-    parsed = urlparse(jar_url)
-    return f"{parsed.scheme}://{parsed.netloc}"
 
 def parse_jar_url(jar_url):
     if "/ui/repos/tree/Xray/" in jar_url:
@@ -33,55 +33,67 @@ def parse_jar_url(jar_url):
     else:
         raise Exception("Unsupported URL format")
 
+    # Dynamically extract the base URL (everything before the marker)
+    base_url = jar_url.split(marker, 1)[0]
     repo_path = jar_url.split(marker, 1)[1]
+
     parts = repo_path.split("/")
     repo = parts[0]
     jar_file = parts[-1]
+
     artifact_path_parts = parts[1:-2]
     group_id = ".".join(artifact_path_parts[:-1])
     artifact_id = artifact_path_parts[-1]
     snapshot_version = parts[-2]
-    
-    timestamp_version = jar_file.replace(f"{artifact_id}-", "").replace(".jar", "")
-    path = f"{repo}/{'/'.join(parts[1:])}"
+
+    timestamp_version = jar_file.replace(f"{artifact_id}-", "").replace(
+        ".jar", ""
+    )
+    path = f"{repo}/" f"{'/'.join(parts[1:])}"
 
     return {
+        "base_url": base_url,
         "group_id": group_id,
         "artifact_id": artifact_id,
         "snapshot_version": snapshot_version,
         "timestamp_version": timestamp_version,
         "path": path,
-        "jar_file": jar_file
+        "jar_file": jar_file,
     }
 
-def get_or_create_session(base_url):
-    """Fetch an existing session for the base_url, or login to create a new one."""
-    if base_url in SESSIONS:
-        return SESSIONS[base_url]
 
+def login():
     session = requests.Session()
-    login_url = f"{base_url}/ui/api/v1/access/auth/login?_spring_security_remember_me=false"
+    print("\nAuthenticating with Artifactory servers...")
 
-    payload = {
-        "username": USERNAME,
-        "password": PASSWORD
-    }
+    for base_url in ARTIFACTORY_BASES:
+        login_url = (
+            f"{base_url}"
+            "/ui/api/v1/access/auth/login"
+            "?_spring_security_remember_me=false"
+        )
+        payload = {"username": USERNAME, "password": PASSWORD}
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            response = session.post(
+                login_url, json=payload, headers=headers, verify=False
+            )
+            response.raise_for_status()
+            print(f"✅ Login Successful : {base_url}")
+        except Exception as e:
+            print(f"⚠️ Login Failed : {base_url} | {str(e)}")
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-Requested-With": "XMLHttpRequest"
-    }
-
-    response = session.post(login_url, json=payload, headers=headers, verify=False)
-    response.raise_for_status()
-
-    print(f"\n✅ Login Successful to : {base_url}")
-    SESSIONS[base_url] = session
     return session
 
-def build_export_url(comp_name, path, base_url):
+
+def build_export_url(base_url, comp_name, path):
     return (
-        f"{base_url}/ui/api/v1/xray/ui/component/exportComponentDetails"
+        f"{base_url}"
+        "/ui/api/v1/xray/ui/component/"
+        "exportComponentDetails"
         f"?prefix=maven"
         f"&comp_name={quote(comp_name)}"
         f"&format=csv"
@@ -94,23 +106,26 @@ def build_export_url(comp_name, path, base_url):
         f"&include_ignored_violations=false"
     )
 
-def add_custom_columns(csv_file, service_name, app_code):
+
+def add_service_name_column(csv_file, service_name, app_code=None):
     try:
         df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
     except UnicodeDecodeError:
-        df = pd.read_csv(csv_file, dtype=str, encoding="latin-1", keep_default_na=False)
+        df = pd.read_csv(
+            csv_file, dtype=str, encoding="latin-1", keep_default_na=False
+        )
 
     df["Service Name"] = service_name
-    
-    # Appending Application Code as the last column if it exists
-    if app_code:
+
+    # Appends Application Code as the last column if provided
+    if app_code is not None:
         df["Application Code"] = app_code
 
     df.to_csv(csv_file, index=False)
+    print(f"✅ Metadata Added : {os.path.basename(csv_file)}")
 
-    print(f"✅ Columns Added to : {os.path.basename(csv_file)}")
 
-def extract_and_rename_reports(zip_file, service_name, app_code):
+def extract_and_rename_reports(zip_file, service_name, app_code=None):
     invalid_chars = '<>:"/\\|?*'
     for ch in invalid_chars:
         service_name = service_name.replace(ch, "_")
@@ -126,13 +141,11 @@ def extract_and_rename_reports(zip_file, service_name, app_code):
 
     for extracted_file in os.listdir(output_folder):
         source_path = os.path.join(output_folder, extracted_file)
-
         if os.path.isdir(source_path):
             continue
 
         filename, extension = os.path.splitext(extracted_file)
         match = re.match(r"^Maven_[^_]+_(.+)$", filename, re.IGNORECASE)
-
         if not match:
             continue
 
@@ -141,10 +154,9 @@ def extract_and_rename_reports(zip_file, service_name, app_code):
         destination_path = os.path.join(output_folder, new_filename)
 
         os.rename(source_path, destination_path)
-
         print(f"✅ Renamed : {extracted_file} -> {new_filename}")
 
-        add_custom_columns(destination_path, service_name, app_code)
+        add_service_name_column(destination_path, service_name, app_code)
         processed_count += 1
 
     print(f"\n✅ Files Processed : {processed_count}")
@@ -155,13 +167,12 @@ def extract_and_rename_reports(zip_file, service_name, app_code):
     except Exception as e:
         print(e)
 
-def download_xray_report(jar_url, output_name=None, app_code=None):
-    jar_url = extract_url(jar_url)
-    base_url = get_base_url(jar_url)
-    session = get_or_create_session(base_url)
 
+def download_xray_report(session, jar_url, output_name=None, app_code=None):
+    jar_url = extract_url(jar_url)
     info = parse_jar_url(jar_url)
 
+    base_url = info["base_url"]
     group_id = info["group_id"]
     artifact_id = info["artifact_id"]
     jar_file = info["jar_file"]
@@ -176,22 +187,29 @@ def download_xray_report(jar_url, output_name=None, app_code=None):
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.6261.112 Safari/537.36"
         ),
-        "Accept": "*/*"
+        "Accept": "*/*",
     }
 
-    print("\nTrying SNAPSHOT version...")
-    url = build_export_url(snapshot_comp, path, base_url)
+    print(f"\nTarget Server: {base_url}")
+    print("Trying SNAPSHOT version...")
 
-    response = session.get(url, headers=headers, verify=False, stream=True, timeout=300)
+    url = build_export_url(base_url, snapshot_comp, path)
+    response = session.get(
+        url, headers=headers, verify=False, stream=True, timeout=300
+    )
 
     # Retry using timestamp version
     if response.status_code != 200:
         print("SNAPSHOT failed.\nTrying timestamp version...")
-        url = build_export_url(timestamp_comp, path, base_url)
-        response = session.get(url, headers=headers, verify=False, stream=True, timeout=300)
+        url = build_export_url(base_url, timestamp_comp, path)
+        response = session.get(
+            url, headers=headers, verify=False, stream=True, timeout=300
+        )
 
     if response.status_code != 200:
-        raise Exception(f"Download Failed | Status={response.status_code} | {response.text}")
+        raise Exception(
+            f"Download Failed | Status={response.status_code} | {response.text}"
+        )
 
     if output_name:
         invalid_chars = '<>:"/\\|?*'
@@ -211,16 +229,18 @@ def download_xray_report(jar_url, output_name=None, app_code=None):
     if output_name:
         extract_and_rename_reports(zip_name, output_name, app_code)
 
+
 def process_excel(excel_file):
     print("\nReading Excel...")
     df = pd.read_excel(excel_file)
 
+    # Added Application Code to required columns validation
     required_columns = ["File Name", "Jfrog Report Link", "Application Code"]
-
     for column in required_columns:
         if column not in df.columns:
-            raise Exception(f"Column '{column}' not found in the Excel file.")
+            raise Exception(f"Column '{column}' not found in Excel file.")
 
+    session = login()
     success = 0
     failure = 0
 
@@ -232,24 +252,30 @@ def process_excel(excel_file):
             jar_url = str(row["Jfrog Report Link"]).strip()
             app_code = str(row["Application Code"]).strip()
 
-            if not file_name or not jar_url or file_name.lower() == "nan" or jar_url.lower() == "nan":
-                continue
-                
+            # Handle blank or NaN values cleanly
             if app_code.lower() == "nan":
                 app_code = ""
 
+            if (
+                not file_name
+                or not jar_url
+                or file_name.lower() == "nan"
+                or jar_url.lower() == "nan"
+            ):
+                continue
+
             print("\n" + "=" * 70)
             print(f"Processing {index + 1} of {len(df)}")
-            print(f"Service Name : {file_name}")
-            print(f"App Code     : {app_code}")
+            print(f"Service Name     : {file_name}")
+            print(f"Application Code : {app_code if app_code else 'N/A'}")
             print("=" * 70)
 
             download_xray_report(
+                session=session,
                 jar_url=jar_url,
                 output_name=file_name,
-                app_code=app_code
+                app_code=app_code,
             )
-
             success += 1
 
         except Exception as e:
@@ -263,9 +289,22 @@ def process_excel(excel_file):
     print(f"Failure : {failure}")
     print("=" * 70)
 
+
 def process_single():
     user_input = input("\nPaste Artifactory URL:\n\n> ")
-    download_xray_report(jar_url=user_input)
+    jar_url = extract_url(user_input)
+
+    app_code = input(
+        "\nEnter Application Code (Press Enter to skip):\n\n> "
+    ).strip()
+
+    session = login()
+    download_xray_report(
+        session=session,
+        jar_url=jar_url,
+        app_code=app_code if app_code else None,
+    )
+
 
 def main():
     print("=" * 70)
@@ -286,6 +325,7 @@ def main():
         process_excel(excel_file)
     else:
         print("\n❌ Invalid Choice")
+
 
 if __name__ == "__main__":
     main()
