@@ -1,0 +1,291 @@
+import os
+import re
+import zipfile
+import requests
+import pandas as pd
+from urllib.parse import quote, urlparse
+
+USERNAME = "c-abhimanyue"
+PASSWORD = "1234"
+
+# Dictionary to cache sessions for different artifactory base URLs
+SESSIONS = {}
+
+requests.packages.urllib3.disable_warnings()
+
+def extract_url(user_input):
+    user_input = str(user_input).strip()
+    match = re.search(r'href="([^"]+)"', user_input)
+    if match:
+        return match.group(1)
+    return user_input
+
+def get_base_url(jar_url):
+    """Dynamically extract the Artifactory base URL from the provided link."""
+    parsed = urlparse(jar_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+def parse_jar_url(jar_url):
+    if "/ui/repos/tree/Xray/" in jar_url:
+        marker = "/ui/repos/tree/Xray/"
+    elif "/ui/repos/tree/General/" in jar_url:
+        marker = "/ui/repos/tree/General/"
+    else:
+        raise Exception("Unsupported URL format")
+
+    repo_path = jar_url.split(marker, 1)[1]
+    parts = repo_path.split("/")
+    repo = parts[0]
+    jar_file = parts[-1]
+    artifact_path_parts = parts[1:-2]
+    group_id = ".".join(artifact_path_parts[:-1])
+    artifact_id = artifact_path_parts[-1]
+    snapshot_version = parts[-2]
+    
+    timestamp_version = jar_file.replace(f"{artifact_id}-", "").replace(".jar", "")
+    path = f"{repo}/{'/'.join(parts[1:])}"
+
+    return {
+        "group_id": group_id,
+        "artifact_id": artifact_id,
+        "snapshot_version": snapshot_version,
+        "timestamp_version": timestamp_version,
+        "path": path,
+        "jar_file": jar_file
+    }
+
+def get_or_create_session(base_url):
+    """Fetch an existing session for the base_url, or login to create a new one."""
+    if base_url in SESSIONS:
+        return SESSIONS[base_url]
+
+    session = requests.Session()
+    login_url = f"{base_url}/ui/api/v1/access/auth/login?_spring_security_remember_me=false"
+
+    payload = {
+        "username": USERNAME,
+        "password": PASSWORD
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+
+    response = session.post(login_url, json=payload, headers=headers, verify=False)
+    response.raise_for_status()
+
+    print(f"\n✅ Login Successful to : {base_url}")
+    SESSIONS[base_url] = session
+    return session
+
+def build_export_url(comp_name, path, base_url):
+    return (
+        f"{base_url}/ui/api/v1/xray/ui/component/exportComponentDetails"
+        f"?prefix=maven"
+        f"&comp_name={quote(comp_name)}"
+        f"&format=csv"
+        f"&path={quote(path)}"
+        f"&license=true"
+        f"&operational_risk=true"
+        f"&vulnerabilities=true"
+        f"&violations=true"
+        f"&exclude_unknown=false"
+        f"&include_ignored_violations=false"
+    )
+
+def add_custom_columns(csv_file, service_name, app_code):
+    try:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+    except UnicodeDecodeError:
+        df = pd.read_csv(csv_file, dtype=str, encoding="latin-1", keep_default_na=False)
+
+    df["Service Name"] = service_name
+    
+    # Appending Application Code as the last column if it exists
+    if app_code:
+        df["Application Code"] = app_code
+
+    df.to_csv(csv_file, index=False)
+
+    print(f"✅ Columns Added to : {os.path.basename(csv_file)}")
+
+def extract_and_rename_reports(zip_file, service_name, app_code):
+    invalid_chars = '<>:"/\\|?*'
+    for ch in invalid_chars:
+        service_name = service_name.replace(ch, "_")
+
+    output_folder = service_name
+    os.makedirs(output_folder, exist_ok=True)
+
+    with zipfile.ZipFile(zip_file, "r") as zip_ref:
+        zip_ref.extractall(output_folder)
+
+    print(f"\n📂 Extracted : {output_folder}")
+    processed_count = 0
+
+    for extracted_file in os.listdir(output_folder):
+        source_path = os.path.join(output_folder, extracted_file)
+
+        if os.path.isdir(source_path):
+            continue
+
+        filename, extension = os.path.splitext(extracted_file)
+        match = re.match(r"^Maven_[^_]+_(.+)$", filename, re.IGNORECASE)
+
+        if not match:
+            continue
+
+        suffix = match.group(1)
+        new_filename = f"{service_name}_{suffix}{extension}"
+        destination_path = os.path.join(output_folder, new_filename)
+
+        os.rename(source_path, destination_path)
+
+        print(f"✅ Renamed : {extracted_file} -> {new_filename}")
+
+        add_custom_columns(destination_path, service_name, app_code)
+        processed_count += 1
+
+    print(f"\n✅ Files Processed : {processed_count}")
+
+    try:
+        os.remove(zip_file)
+        print(f"🗑️ ZIP Deleted : {zip_file}")
+    except Exception as e:
+        print(e)
+
+def download_xray_report(jar_url, output_name=None, app_code=None):
+    jar_url = extract_url(jar_url)
+    base_url = get_base_url(jar_url)
+    session = get_or_create_session(base_url)
+
+    info = parse_jar_url(jar_url)
+
+    group_id = info["group_id"]
+    artifact_id = info["artifact_id"]
+    jar_file = info["jar_file"]
+    path = info["path"]
+
+    snapshot_comp = f"{group_id}:{artifact_id}:{info['snapshot_version']}"
+    timestamp_comp = f"{group_id}:{artifact_id}:{info['timestamp_version']}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.6261.112 Safari/537.36"
+        ),
+        "Accept": "*/*"
+    }
+
+    print("\nTrying SNAPSHOT version...")
+    url = build_export_url(snapshot_comp, path, base_url)
+
+    response = session.get(url, headers=headers, verify=False, stream=True, timeout=300)
+
+    # Retry using timestamp version
+    if response.status_code != 200:
+        print("SNAPSHOT failed.\nTrying timestamp version...")
+        url = build_export_url(timestamp_comp, path, base_url)
+        response = session.get(url, headers=headers, verify=False, stream=True, timeout=300)
+
+    if response.status_code != 200:
+        raise Exception(f"Download Failed | Status={response.status_code} | {response.text}")
+
+    if output_name:
+        invalid_chars = '<>:"/\\|?*'
+        for ch in invalid_chars:
+            output_name = output_name.replace(ch, "_")
+        zip_name = f"{output_name}.zip"
+    else:
+        zip_name = jar_file.replace(".jar", "") + "-xray-report.zip"
+
+    with open(zip_name, "wb") as file:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                file.write(chunk)
+
+    print(f"✅ Downloaded : {zip_name}")
+
+    if output_name:
+        extract_and_rename_reports(zip_name, output_name, app_code)
+
+def process_excel(excel_file):
+    print("\nReading Excel...")
+    df = pd.read_excel(excel_file)
+
+    required_columns = ["File Name", "Jfrog Report Link", "Application Code"]
+
+    for column in required_columns:
+        if column not in df.columns:
+            raise Exception(f"Column '{column}' not found in the Excel file.")
+
+    success = 0
+    failure = 0
+
+    print(f"\nRecords Found : {len(df)}")
+
+    for index, row in df.iterrows():
+        try:
+            file_name = str(row["File Name"]).strip()
+            jar_url = str(row["Jfrog Report Link"]).strip()
+            app_code = str(row["Application Code"]).strip()
+
+            if not file_name or not jar_url or file_name.lower() == "nan" or jar_url.lower() == "nan":
+                continue
+                
+            if app_code.lower() == "nan":
+                app_code = ""
+
+            print("\n" + "=" * 70)
+            print(f"Processing {index + 1} of {len(df)}")
+            print(f"Service Name : {file_name}")
+            print(f"App Code     : {app_code}")
+            print("=" * 70)
+
+            download_xray_report(
+                jar_url=jar_url,
+                output_name=file_name,
+                app_code=app_code
+            )
+
+            success += 1
+
+        except Exception as e:
+            failure += 1
+            print(f"\n❌ Failed : {file_name}")
+            print(str(e))
+
+    print("\n" + "=" * 70)
+    print("PROCESS COMPLETED")
+    print(f"Success : {success}")
+    print(f"Failure : {failure}")
+    print("=" * 70)
+
+def process_single():
+    user_input = input("\nPaste Artifactory URL:\n\n> ")
+    download_xray_report(jar_url=user_input)
+
+def main():
+    print("=" * 70)
+    print("XRAY SCA REPORT DOWNLOADER")
+    print("=" * 70)
+    print("\n1. Single Download")
+    print("2. Excel Bulk Download")
+
+    choice = input("\nEnter Choice (1/2): ").strip()
+
+    if choice == "1":
+        process_single()
+    elif choice == "2":
+        excel_file = input("\nEnter Excel File Path:\n\n> ").strip()
+        if not os.path.exists(excel_file):
+            print("\n❌ Excel file not found")
+            return
+        process_excel(excel_file)
+    else:
+        print("\n❌ Invalid Choice")
+
+if __name__ == "__main__":
+    main()
