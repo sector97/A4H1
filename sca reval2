@@ -1,0 +1,534 @@
+import os
+import re
+import zipfile
+import requests
+import pandas as pd
+import openpyxl
+from urllib.parse import quote
+
+USERNAME = "c-abhimanyue"
+PASSWORD = "1234"
+
+ARTIFACTORY_BASES = [
+    "https://lower-artifactory.crisil.local",
+    "https://ue1-lower-artifactory.crisil.local",
+]
+
+# Hardcoded Master Paths mapped to their specific file types and status columns
+REVALIDATION_FILES = {
+    "operational": {
+        "path": r"C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\2026\Operational.xlsx",
+        "sheet": "Operational",
+        "status_col": 15  # Column O default
+    },
+    "security": {
+        "path": r"C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\2026\Security.xlsx",
+        "sheet": "Security",
+        "status_col": 17  # Column Q default
+    },
+    "violations": {
+        "path": r"C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\2026\Violations.xlsx",
+        "sheet": "Violations",
+        "status_col": 14  # Column N default
+    }
+}
+
+# Global list to track changes for the Consolidated Log
+CHANGE_LOGS = []
+
+requests.packages.urllib3.disable_warnings()
+
+
+def extract_url(user_input):
+    user_input = str(user_input).strip()
+    match = re.search(r'href="([^"]+)"', user_input)
+    if match:
+        return match.group(1)
+    return user_input
+
+
+def parse_jar_url(jar_url):
+    if "/ui/repos/tree/Xray/" in jar_url:
+        marker = "/ui/repos/tree/Xray/"
+    elif "/ui/repos/tree/General/" in jar_url:
+        marker = "/ui/repos/tree/General/"
+    else:
+        raise Exception("Unsupported URL format")
+
+    base_url = jar_url.split(marker, 1)[0]
+    repo_path = jar_url.split(marker, 1)[1]
+
+    parts = repo_path.split("/")
+    repo = parts[0]
+    jar_file = parts[-1]
+
+    artifact_path_parts = parts[1:-2]
+    group_id = ".".join(artifact_path_parts[:-1])
+    artifact_id = artifact_path_parts[-1]
+    snapshot_version = parts[-2]
+
+    timestamp_version = jar_file.replace(f"{artifact_id}-", "").replace(".jar", "")
+    path = f"{repo}/" f"{'/'.join(parts[1:])}"
+
+    return {
+        "base_url": base_url,
+        "group_id": group_id,
+        "artifact_id": artifact_id,
+        "snapshot_version": snapshot_version,
+        "timestamp_version": timestamp_version,
+        "path": path,
+        "jar_file": jar_file,
+    }
+
+
+def login():
+    session = requests.Session()
+    print("\nAuthenticating with Artifactory servers...")
+
+    for base_url in ARTIFACTORY_BASES:
+        login_url = (
+            f"{base_url}"
+            "/ui/api/v1/access/auth/login"
+            "?_spring_security_remember_me=false"
+        )
+        payload = {"username": USERNAME, "password": PASSWORD}
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        try:
+            response = session.post(
+                login_url, json=payload, headers=headers, verify=False
+            )
+            response.raise_for_status()
+            print(f"✅ Login Successful : {base_url}")
+        except Exception as e:
+            print(f"⚠️ Login Failed : {base_url} | {str(e)}")
+
+    return session
+
+
+def build_export_url(base_url, comp_name, path):
+    return (
+        f"{base_url}"
+        "/ui/api/v1/xray/ui/component/"
+        "exportComponentDetails"
+        f"?prefix=maven"
+        f"&comp_name={quote(comp_name)}"
+        f"&format=csv"
+        f"&path={quote(path)}"
+        f"&license=true"
+        f"&operational_risk=true"
+        f"&vulnerabilities=true"
+        f"&violations=true"
+        f"&exclude_unknown=false"
+        f"&include_ignored_violations=false"
+    )
+
+
+def process_csv_and_get_uids(csv_file, service_name, app_code=None):
+    """Adds metadata, generates Unique ID based on file type, and returns UIDs for validation."""
+    try:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+    except UnicodeDecodeError:
+        df = pd.read_csv(csv_file, dtype=str, encoding="latin-1", keep_default_na=False)
+
+    df["Service Name"] = service_name
+    app_code_str = str(app_code).strip() if app_code else ""
+    df["Application Code"] = app_code_str
+
+    filename_lower = os.path.basename(csv_file).lower()
+    file_type = None
+
+    try:
+        if "operational" in filename_lower:
+            file_type = "operational"
+            comp = df.iloc[:, 0].astype(str).str.strip()  # Column A
+            ver = df.iloc[:, 1].astype(str).str.strip()   # Column B
+            df["Unique Id"] = comp + " " + ver + " " + service_name + " " + app_code_str
+
+        elif "vulnerabilit" in filename_lower or "security" in filename_lower:
+            file_type = "security"
+            # Column O is index 14
+            if len(df.columns) > 14:
+                sec_id = df.iloc[:, 14].astype(str).str.strip()
+            elif "Id" in df.columns:
+                sec_id = df["Id"].astype(str).str.strip()
+            else:
+                sec_id = ""
+            df["Unique Id"] = sec_id + " " + service_name + " " + app_code_str
+
+        elif "violation" in filename_lower:
+            file_type = "violations"
+            # Column F is index 5
+            if len(df.columns) > 5:
+                comp = df.iloc[:, 5].astype(str).str.strip()
+            elif "Component" in df.columns:
+                comp = df["Component"].astype(str).str.strip()
+            else:
+                comp = ""
+            df["Unique Id"] = comp + " " + service_name + " " + app_code_str
+
+    except Exception as e:
+        print(f"⚠️ Error creating Unique Id for {csv_file}: {e}")
+
+    # Standardize Spaces in CSV UID
+    if "Unique Id" in df.columns:
+        df["Unique Id"] = df["Unique Id"].str.replace(r'\s+', ' ', regex=True).str.strip()
+        unique_ids = df["Unique Id"].tolist()
+    else:
+        unique_ids = []
+
+    # Save modified CSV
+    df.to_csv(csv_file, index=False)
+    print(f"✅ Metadata & Unique ID Added : {os.path.basename(csv_file)}")
+
+    # Return lowercased UIDs for robust comparison later
+    normalized_uids = [" ".join(str(uid).lower().split()) for uid in unique_ids if uid.strip()]
+    return file_type, normalized_uids
+
+
+def update_revalidation_file(file_type, unique_ids_from_csv, service_name, app_code):
+    """Opens master Excel, strictly checks App Code -> Service Name, then updates Status."""
+    global CHANGE_LOGS
+
+    if file_type not in REVALIDATION_FILES:
+        return
+        
+    config = REVALIDATION_FILES[file_type]
+    path = config["path"]
+    sheet = config["sheet"]
+    default_status_col = config["status_col"]
+    
+    if not os.path.exists(path):
+        print(f"⚠️ Revalidation file not found: {path}")
+        return
+        
+    try:
+        csv_uids = set(unique_ids_from_csv)
+        
+        wb = openpyxl.load_workbook(path)
+        if sheet not in wb.sheetnames:
+            print(f"⚠️ Sheet '{sheet}' not found in {path}")
+            return
+            
+        ws = wb[sheet]
+        
+        # Build Case-Insensitive Header Map
+        headers = {str(cell.value).strip().lower(): idx for idx, cell in enumerate(ws[1], start=1) if cell.value}
+        
+        # 1. Strictly verify Application Code column exists
+        app_col = headers.get('application code')
+        if not app_col:
+            print(f"⚠️ 'Application Code' column missing in Master file: {path}")
+            return
+
+        # 2. Strictly verify Service Name column exists
+        svc_col = headers.get('service name')
+        if not svc_col:
+            print(f"⚠️ 'Service Name' column missing in Master file: {path}")
+            return
+
+        # 3. Verify Unique Id column
+        uid_col = headers.get('unique id', headers.get('uniqueid', headers.get('unique id ')))
+        if not uid_col:
+            print(f"⚠️ 'Unique Id' column missing in Master file: {path}")
+            return
+            
+        status_col = headers.get('status', default_status_col)
+        
+        target_svc = str(service_name).strip().lower()
+        target_app = str(app_code).strip().lower()
+
+        updated_rows = 0
+
+        for row in range(2, ws.max_row + 1):
+            cell_app_raw = str(ws.cell(row=row, column=app_col).value or "").strip()
+            
+            # CHECK 1: Application Code
+            if cell_app_raw.lower() == target_app:
+                
+                cell_svc_raw = str(ws.cell(row=row, column=svc_col).value or "").strip()
+                
+                # CHECK 2: Service Name
+                if cell_svc_raw.lower() == target_svc:
+                    
+                    # BOTH PRESENT AND MATCHED -> Proceed to Comparison
+                    cell_uid_raw = str(ws.cell(row=row, column=uid_col).value or "").strip()
+                    cell_uid_normalized = " ".join(cell_uid_raw.lower().split())
+                    
+                    old_status = str(ws.cell(row=row, column=status_col).value or "").strip()
+                    
+                    if cell_uid_normalized in csv_uids:
+                        new_status = 'Open'
+                    else:
+                        new_status = 'Closed'
+
+                    # Update and log if changed
+                    if old_status != new_status:
+                        ws.cell(row=row, column=status_col).value = new_status
+                        
+                        CHANGE_LOGS.append({
+                            "Master Tracker": os.path.basename(path),
+                            "Row Number": row,
+                            "Service Name": cell_svc_raw,
+                            "Application Code": cell_app_raw,
+                            "Unique Id": cell_uid_raw,
+                            "Previous Status": old_status,
+                            "New Status": new_status
+                        })
+                        updated_rows += 1
+                
+        if updated_rows > 0:
+            try:
+                wb.save(path)
+                print(f"✅ Revalidated Master ({updated_rows} rows updated) : {os.path.basename(path)}")
+            except PermissionError:
+                print(f"❌ PERMISSION ERROR: Could not save '{os.path.basename(path)}'. Please close the Excel file and try again.")
+        else:
+            print(f"ℹ️ No status changes required in Master : {os.path.basename(path)}")
+            
+    except Exception as e:
+        print(f"❌ Failed to process Master Excel {path}: {str(e)}")
+
+
+def extract_and_rename_reports(zip_file, service_name, app_code=None):
+    invalid_chars = '<>:"/\\|?*'
+    for ch in invalid_chars:
+        service_name = service_name.replace(ch, "_")
+
+    output_folder = service_name
+    os.makedirs(output_folder, exist_ok=True)
+
+    with zipfile.ZipFile(zip_file, "r") as zip_ref:
+        zip_ref.extractall(output_folder)
+
+    print(f"\n📂 Extracted : {output_folder}")
+    processed_count = 0
+
+    for extracted_file in os.listdir(output_folder):
+        source_path = os.path.join(output_folder, extracted_file)
+        if os.path.isdir(source_path):
+            continue
+
+        filename, extension = os.path.splitext(extracted_file)
+        match = re.match(r"^Maven_[^_]+_(.+)$", filename, re.IGNORECASE)
+        if not match:
+            continue
+
+        suffix = match.group(1)
+        new_filename = f"{service_name}_{suffix}{extension}"
+        destination_path = os.path.join(output_folder, new_filename)
+
+        os.rename(source_path, destination_path)
+        print(f"✅ Renamed : {extracted_file} -> {new_filename}")
+
+        # Modify CSV, Get UIDs, and Revalidate Master
+        file_type, extracted_uids = process_csv_and_get_uids(destination_path, service_name, app_code)
+        
+        if file_type and extracted_uids:
+            update_revalidation_file(file_type, extracted_uids, service_name, app_code)
+
+        processed_count += 1
+
+    print(f"\n✅ Files Processed : {processed_count}")
+
+    try:
+        os.remove(zip_file)
+        print(f"🗑️ ZIP Deleted : {zip_file}")
+    except Exception as e:
+        print(e)
+
+
+def download_xray_report(session, jar_url, output_name=None, app_code=None):
+    jar_url = extract_url(jar_url)
+    info = parse_jar_url(jar_url)
+
+    base_url = info["base_url"]
+    group_id = info["group_id"]
+    artifact_id = info["artifact_id"]
+    jar_file = info["jar_file"]
+    path = info["path"]
+
+    snapshot_comp = f"{group_id}:{artifact_id}:{info['snapshot_version']}"
+    timestamp_comp = f"{group_id}:{artifact_id}:{info['timestamp_version']}"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.6261.112 Safari/537.36"
+        ),
+        "Accept": "*/*",
+    }
+
+    print(f"\nTarget Server: {base_url}")
+    print("Trying SNAPSHOT version...")
+
+    url = build_export_url(base_url, snapshot_comp, path)
+    response = session.get(
+        url, headers=headers, verify=False, stream=True, timeout=300
+    )
+
+    if response.status_code != 200:
+        print("SNAPSHOT failed.\nTrying timestamp version...")
+        url = build_export_url(base_url, timestamp_comp, path)
+        response = session.get(
+            url, headers=headers, verify=False, stream=True, timeout=300
+        )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Download Failed | Status={response.status_code} | {response.text}"
+        )
+
+    # Note: If output_name is missing, we wouldn't extract. The single download now guarantees it.
+    if output_name:
+        invalid_chars = '<>:"/\\|?*'
+        for ch in invalid_chars:
+            output_name = output_name.replace(ch, "_")
+        zip_name = f"{output_name}.zip"
+    else:
+        zip_name = jar_file.replace(".jar", "") + "-xray-report.zip"
+
+    with open(zip_name, "wb") as file:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                file.write(chunk)
+
+    print(f"✅ Downloaded : {zip_name}")
+
+    if output_name:
+        extract_and_rename_reports(zip_name, output_name, app_code)
+
+
+def process_excel(excel_file):
+    print("\nReading Excel...")
+    df = pd.read_excel(excel_file)
+
+    required_columns = ["Service Name", "Jfrog Report Link", "Application Code"]
+    for column in required_columns:
+        if column not in df.columns:
+            raise Exception(f"Column '{column}' not found in Excel file.")
+
+    session = login()
+    success = 0
+    failure = 0
+
+    print(f"\nRecords Found : {len(df)}")
+
+    for index, row in df.iterrows():
+        try:
+            service_name = str(row["Service Name"]).strip()
+            jar_url = str(row["Jfrog Report Link"]).strip()
+            app_code = str(row["Application Code"]).strip()
+
+            if app_code.lower() == "nan":
+                app_code = ""
+
+            if (
+                not service_name
+                or not jar_url
+                or service_name.lower() == "nan"
+                or jar_url.lower() == "nan"
+            ):
+                continue
+
+            print("\n" + "=" * 70)
+            print(f"Processing {index + 1} of {len(df)}")
+            print(f"Service Name     : {service_name}")
+            print(f"Application Code : {app_code if app_code else 'N/A'}")
+            print("=" * 70)
+
+            download_xray_report(
+                session=session,
+                jar_url=jar_url,
+                output_name=service_name,
+                app_code=app_code,
+            )
+            success += 1
+
+        except Exception as e:
+            failure += 1
+            print(f"\n❌ Failed : {service_name}")
+            print(str(e))
+
+    print("\n" + "=" * 70)
+    print("PROCESS COMPLETED")
+    print(f"Success : {success}")
+    print(f"Failure : {failure}")
+    print("=" * 70)
+
+
+def process_single():
+    user_input = input("\nPaste Artifactory URL:\n\n> ")
+    jar_url = extract_url(user_input)
+    
+    # NEW: Prompt for Service Name so the extraction and Master updates run
+    service_name = input(
+        "\nEnter Service Name (Required for Revalidation):\n\n> "
+    ).strip()
+
+    if not service_name:
+        print("\n⚠️ Service Name is required for extraction and Master Tracking. Process aborted.")
+        return
+
+    app_code = input(
+        "\nEnter Application Code (Press Enter to skip):\n\n> "
+    ).strip()
+
+    session = login()
+    
+    # Pass service_name as output_name so it gets funneled into the exact same logic
+    download_xray_report(
+        session=session,
+        jar_url=jar_url,
+        output_name=service_name, 
+        app_code=app_code if app_code else None,
+    )
+
+
+def save_change_logs():
+    """Outputs the global change logs to a consolidated Excel file."""
+    if CHANGE_LOGS:
+        print("\n" + "=" * 70)
+        print("GENERATING REVALIDATION CHANGE LOG...")
+        print("=" * 70)
+        log_df = pd.DataFrame(CHANGE_LOGS)
+        log_filename = "Revalidation_Change_Log.xlsx"
+        
+        try:
+            log_df.to_excel(log_filename, index=False)
+            print(f"✅ Change log saved successfully: {os.path.abspath(log_filename)}")
+        except PermissionError:
+            print(f"❌ PERMISSION ERROR: Could not save '{log_filename}'. Please ensure the file is closed.")
+    else:
+        print("\nℹ️ No status changes were made to the Master trackers during this run.")
+
+
+def main():
+    print("=" * 70)
+    print("XRAY SCA REPORT DOWNLOADER & MASTER VALIDATOR")
+    print("=" * 70)
+    print("\n1. Single Download")
+    print("2. Excel Bulk Download")
+
+    choice = input("\nEnter Choice (1/2): ").strip()
+
+    if choice == "1":
+        process_single()
+    elif choice == "2":
+        excel_file = input("\nEnter Excel File Path:\n\n> ").strip()
+        if not os.path.exists(excel_file):
+            print("\n❌ Excel file not found")
+            return
+        process_excel(excel_file)
+    else:
+        print("\n❌ Invalid Choice")
+
+    # Save the consolidated log at the very end
+    save_change_logs()
+
+
+if __name__ == "__main__":
+    main()
