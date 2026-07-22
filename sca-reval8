@@ -1,0 +1,476 @@
+import os
+import re
+import zipfile
+import requests
+import pandas as pd
+import openpyxl
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+USERNAME = "c-abhimanyue"
+PASSWORD = "1234"
+
+ARTIFACTORY_BASES = [
+    "https://lower-artifactory.crisil.local",
+    "https://ue1-lower-artifactory.crisil.local",
+]
+
+REVALIDATION_FILES = {
+    "operational": {
+        "path": r"C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\2026\Operational.xlsx",
+        "sheet": "Operational",
+        "status_col": 15
+    },
+    "security": {
+        "path": r"C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\2026\Security.xlsx",
+        "sheet": "Security",
+        "status_col": 17
+    },
+    "violations": {
+        "path": r"C:\Users\c-abhimanyue\OneDrive - crisil.com\All Trackers - CRISIL\SCA\Automation\2026\Violations.xlsx",
+        "sheet": "Violations",
+        "status_col": 14
+    }
+}
+
+# --- THREADING GLOBALS & LOCKS ---
+MAX_CONCURRENT_DOWNLOADS = 10
+PRINT_LOCK = threading.Lock()
+DATA_LOCK = threading.Lock()
+
+GLOBAL_EXTRACTED_UIDS = {
+    "operational": {},
+    "security": {},
+    "violations": {}
+}
+
+CHANGE_SUMMARY = {
+    "Operational": 0,
+    "Security": 0,
+    "Violations": 0
+}
+
+CHANGE_LOGS = []
+
+requests.packages.urllib3.disable_warnings()
+
+
+def safe_print(message):
+    with PRINT_LOCK:
+        print(message)
+
+
+def clean_filename(name):
+    return re.sub(r'[<>:"/\\|?*]', '_', str(name)).strip()
+
+
+def extract_url(user_input):
+    user_input = str(user_input).strip()
+    match = re.search(r'href="([^"]+)"', user_input)
+    if match:
+        return match.group(1)
+    return user_input
+
+
+def parse_jar_url(jar_url):
+    if "/ui/repos/tree/Xray/" in jar_url:
+        marker = "/ui/repos/tree/Xray/"
+    elif "/ui/repos/tree/General/" in jar_url:
+        marker = "/ui/repos/tree/General/"
+    else:
+        raise Exception("Unsupported URL format")
+
+    base_url = jar_url.split(marker, 1)[0]
+    repo_path = jar_url.split(marker, 1)[1]
+    parts = repo_path.split("/")
+    repo = parts[0]
+    jar_file = parts[-1]
+    path = f"{repo}/" + "/".join(parts[1:])
+
+    candidates = []
+
+    # Strategy 1: Standard Maven path parsing
+    if len(parts) >= 4:
+        artifact_path_parts = parts[1:-2]
+        group_id_std = ".".join(artifact_path_parts[:-1]) if len(artifact_path_parts) > 1 else (artifact_path_parts[0] if artifact_path_parts else "")
+        artifact_id_std = artifact_path_parts[-1] if artifact_path_parts else ""
+        version_std = parts[-2]
+        if group_id_std and artifact_id_std and version_std:
+            candidates.append(f"{group_id_std}:{artifact_id_std}:{version_std}")
+
+    # Strategy 2: Extract Artifact ID & Version directly from JAR filename (for non-standard pipeline paths)
+    fn_match = re.match(r"^(.+?)-(\d+\..+)\.jar$", jar_file, re.IGNORECASE)
+    if fn_match:
+        art_id_fn = fn_match.group(1)
+        ver_fn = fn_match.group(2)
+        candidates.append(f"{art_id_fn}:{art_id_fn}:{ver_fn}")
+        candidates.append(f"com.crisil.{art_id_fn}:{art_id_fn}:{ver_fn}")
+        candidates.append(f"com.crisil:{art_id_fn}:{ver_fn}")
+
+    return {
+        "base_url": base_url,
+        "path": path,
+        "jar_file": jar_file,
+        "comp_candidates": list(dict.fromkeys(candidates))  # Preserves order & removes duplicates
+    }
+
+
+def login():
+    session_map = {}
+    print("\nAuthenticating with Artifactory servers...")
+
+    for base_url in ARTIFACTORY_BASES:
+        session = requests.Session()
+        retry = Retry(connect=3, backoff_factor=0.5)
+        adapter = HTTPAdapter(pool_connections=MAX_CONCURRENT_DOWNLOADS, pool_maxsize=MAX_CONCURRENT_DOWNLOADS, max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+
+        login_url = f"{base_url}/ui/api/v1/access/auth/login?_spring_security_remember_me=false"
+        payload = {"username": USERNAME, "password": PASSWORD}
+        headers = {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"}
+        try:
+            response = session.post(login_url, json=payload, headers=headers, verify=False)
+            response.raise_for_status()
+            print(f"✅ Login Successful : {base_url}")
+            session_map[base_url] = session
+        except Exception as e:
+            print(f"⚠️ Login Failed : {base_url} | {str(e)}")
+
+    return session_map
+
+
+def build_export_url(base_url, comp_name, path):
+    # CRITICAL FIX: safe='' ensures '/' in path is percent-encoded as '%2F'
+    return (
+        f"{base_url}/ui/api/v1/xray/ui/component/exportComponentDetails"
+        f"?prefix=maven&comp_name={quote(comp_name, safe='')}&format=csv&path={quote(path, safe='')}"
+        f"&license=true&operational_risk=true&vulnerabilities=true&violations=true"
+        f"&exclude_unknown=false&include_ignored_violations=false"
+    )
+
+
+def process_csv_and_get_uids(csv_file, service_name, app_code=None):
+    try:
+        df = pd.read_csv(csv_file, dtype=str, keep_default_na=False)
+    except UnicodeDecodeError:
+        df = pd.read_csv(csv_file, dtype=str, encoding="latin-1", keep_default_na=False)
+
+    app_code_str = str(app_code).strip() if app_code else ""
+    df["Service Name"] = service_name
+    df["Application Code"] = app_code_str
+    filename_lower = os.path.basename(csv_file).lower()
+    file_type = None
+
+    if "operational" in filename_lower: file_type = "operational"
+    elif "vulnerabilit" in filename_lower or "security" in filename_lower: file_type = "security"
+    elif "violation" in filename_lower: file_type = "violations"
+
+    if len(df) == 0:
+        df.to_csv(csv_file, index=False)
+        return file_type, []
+
+    try:
+        if file_type == "operational":
+            comp = df.iloc[:, 0].astype(str).str.strip()
+            ver = df.iloc[:, 1].astype(str).str.strip()
+            df["Unique Id"] = comp + " " + ver + " " + service_name + " " + app_code_str
+        elif file_type == "security":
+            sec_id = df.iloc[:, 14].fillna("").astype(str).str.strip() if len(df.columns) > 14 else df.get("Id", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
+            comp_paths = df.iloc[:, 18].fillna("").astype(str).str.strip() if len(df.columns) > 18 else df.get("Component Physical Paths", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
+            sec_id, comp_paths = sec_id.replace("nan", ""), comp_paths.replace("nan", "")
+            df["Unique Id"] = sec_id + " " + comp_paths + " " + service_name + " " + app_code_str
+        elif file_type == "violations":
+            comp = df.iloc[:, 5].astype(str).str.strip() if len(df.columns) > 5 else df.get("Component", pd.Series(dtype=str)).astype(str).str.strip()
+            df["Unique Id"] = comp + " " + service_name + " " + app_code_str
+    except Exception as e:
+        safe_print(f"⚠️ Error creating Unique Id for {csv_file}: {e}")
+
+    if "Unique Id" in df.columns:
+        df["Unique Id"] = df["Unique Id"].str.replace(r'\s+', ' ', regex=True).str.strip()
+        unique_ids = df["Unique Id"].tolist()
+    else:
+        unique_ids = []
+
+    df.to_csv(csv_file, index=False)
+    normalized_uids = [" ".join(str(uid).lower().split()) for uid in unique_ids if uid.strip()]
+    return file_type, normalized_uids
+
+
+def extract_and_rename_reports(zip_file, service_name, app_code=None):
+    service_name_clean = clean_filename(service_name)
+    app_folder = os.path.dirname(zip_file)
+    output_folder = os.path.join(app_folder, service_name_clean)
+    os.makedirs(output_folder, exist_ok=True)
+
+    target_app = str(app_code).strip().lower() if app_code else ""
+    target_svc = str(service_name).strip().lower()
+    dict_key = (target_app, target_svc)
+
+    with DATA_LOCK:
+        for f_type in GLOBAL_EXTRACTED_UIDS:
+            if dict_key not in GLOBAL_EXTRACTED_UIDS[f_type]:
+                GLOBAL_EXTRACTED_UIDS[f_type][dict_key] = set()
+
+    with zipfile.ZipFile(zip_file, "r") as zip_ref:
+        zip_ref.extractall(output_folder)
+
+    for extracted_file in os.listdir(output_folder):
+        source_path = os.path.join(output_folder, extracted_file)
+        if os.path.isdir(source_path): continue
+
+        filename, extension = os.path.splitext(extracted_file)
+        match = re.match(r"^Maven_[^_]+_(.+)$", filename, re.IGNORECASE)
+        if not match: continue
+
+        suffix = match.group(1)
+        new_filename = f"{service_name_clean}_{suffix}{extension}"
+        destination_path = os.path.join(output_folder, new_filename)
+        os.rename(source_path, destination_path)
+        
+        file_type, extracted_uids = process_csv_and_get_uids(destination_path, service_name, app_code)
+        if file_type:
+            with DATA_LOCK: GLOBAL_EXTRACTED_UIDS[file_type][dict_key].update(extracted_uids)
+
+    try: os.remove(zip_file)
+    except: pass
+
+
+def download_xray_report(session_map, jar_url, output_name, idx=None, app_code=None):
+    jar_url = extract_url(jar_url)
+    info = parse_jar_url(jar_url)
+
+    base_url = info["base_url"]
+    path = info["path"]
+    candidates = info["comp_candidates"]
+
+    session = session_map.get(base_url)
+    if not session:
+        raise Exception(f"No active authenticated session for {base_url}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+
+    response = None
+    last_status = None
+
+    # Try component name candidates sequentially until one returns HTTP 200
+    for comp_name in candidates:
+        url = build_export_url(base_url, comp_name, path)
+        res = session.get(url, headers=headers, verify=False, stream=True, timeout=300)
+        if res.status_code == 200:
+            response = res
+            break
+        else:
+            last_status = res.status_code
+
+    if not response or response.status_code != 200:
+        raise Exception(f"Download Failed | Status={last_status or 'Unknown'}")
+
+    safe_app_code = clean_filename(app_code) if app_code else "Uncategorized"
+    os.makedirs(safe_app_code, exist_ok=True)
+    clean_name = clean_filename(output_name)
+    zip_filename = f"{clean_name}_{idx}.zip" if idx is not None else f"{clean_name}.zip"
+    zip_path = os.path.join(safe_app_code, zip_filename)
+
+    with open(zip_path, "wb") as file:
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk: file.write(chunk)
+
+    safe_print(f"✅ Downloaded : {clean_name} -> [{safe_app_code}]")
+    extract_and_rename_reports(zip_path, output_name, app_code)
+
+
+def batch_update_master_files():
+    global CHANGE_SUMMARY
+    safe_print("\n" + "=" * 70)
+    safe_print("STARTING HIGH-SPEED BATCH MASTER VALIDATION...")
+    safe_print("=" * 70)
+
+    for file_type, config in REVALIDATION_FILES.items():
+        tracker_name = file_type.capitalize()
+        cache = GLOBAL_EXTRACTED_UIDS.get(file_type, {})
+        if not cache: continue
+
+        path = config["path"]
+        sheet = config["sheet"]
+        if not os.path.exists(path):
+            safe_print(f"⚠️ Revalidation file not found: {path}")
+            continue
+
+        try:
+            safe_print(f"🔄 Opening Master Tracker: {os.path.basename(path)}...")
+            
+            wb_val = openpyxl.load_workbook(path, data_only=True)
+            wb_rw = openpyxl.load_workbook(path)
+            
+            if sheet not in wb_val.sheetnames: continue
+                
+            ws_val = wb_val[sheet]
+            ws_rw = wb_rw[sheet]
+            
+            headers = {str(cell.value).strip().lower(): idx for idx, cell in enumerate(ws_val[1], start=1) if cell.value}
+            app_col = headers.get('application code')
+            svc_col = headers.get('service name')
+            uid_col = headers.get('unique id', headers.get('uniqueid', headers.get('unique id ')))
+            status_col = headers.get('status', config["status_col"])
+
+            op_comp_col = headers.get('component', 1)
+            op_ver_col = headers.get('version in use', headers.get('version', 2))
+            sec_id_col = headers.get('id', 15)
+            sec_path_col = headers.get('component physical paths', 19)
+            viol_comp_col = headers.get('component', 6)
+
+            if not all([app_col, svc_col, uid_col]):
+                safe_print(f"⚠️ Missing critical metadata columns in {path}. Skipping.")
+                continue
+
+            updated_rows = 0
+
+            for row in range(2, ws_val.max_row + 1):
+                cell_app_raw = str(ws_val.cell(row=row, column=app_col).value or "").strip()
+                cell_svc_raw = str(ws_val.cell(row=row, column=svc_col).value or "").strip()
+                dict_key = (cell_app_raw.lower(), cell_svc_raw.lower())
+                
+                if dict_key in cache:
+                    csv_uids_for_this_app = cache[dict_key]
+                    cell_uid_raw = str(ws_val.cell(row=row, column=uid_col).value or "").strip()
+                    
+                    if not cell_uid_raw or cell_uid_raw.startswith("="):
+                        if file_type == "operational":
+                            comp = str(ws_val.cell(row=row, column=op_comp_col).value or "").strip()
+                            ver = str(ws_val.cell(row=row, column=op_ver_col).value or "").strip()
+                            cell_uid_raw = f"{comp} {ver} {cell_svc_raw} {cell_app_raw}"
+                        elif file_type == "security":
+                            s_id = str(ws_val.cell(row=row, column=sec_id_col).value or "").strip()
+                            s_path = str(ws_val.cell(row=row, column=sec_path_col).value or "").strip()
+                            cell_uid_raw = f"{s_id} {s_path} {cell_svc_raw} {cell_app_raw}"
+                        elif file_type == "violations":
+                            comp = str(ws_val.cell(row=row, column=viol_comp_col).value or "").strip()
+                            cell_uid_raw = f"{comp} {cell_svc_raw} {cell_app_raw}"
+
+                    cell_uid_normalized = " ".join(cell_uid_raw.lower().split())
+                    old_status = str(ws_val.cell(row=row, column=status_col).value or "").strip()
+                    new_status = 'Open' if cell_uid_normalized in csv_uids_for_this_app else 'Closed'
+
+                    ws_rw.cell(row=row, column=uid_col).value = " ".join(cell_uid_raw.split())
+
+                    if old_status != new_status:
+                        ws_rw.cell(row=row, column=status_col).value = new_status
+                        CHANGE_LOGS.append({
+                            "Application Code": cell_app_raw,
+                            "Master Tracker": os.path.basename(path),
+                            "Row Number": row,
+                            "Service Name": cell_svc_raw,
+                            "Unique Id": cell_uid_raw,
+                            "Previous Status": old_status,
+                            "New Status": new_status
+                        })
+                        updated_rows += 1
+            
+            CHANGE_SUMMARY[tracker_name] += updated_rows
+
+            if updated_rows > 0 or cache:
+                wb_rw.save(path)
+                safe_print(f"✅ Batch Saved: {updated_rows} statuses & UID values updated in {os.path.basename(path)}")
+            else:
+                safe_print(f"ℹ️ Processed cleanly: No status changes required in {os.path.basename(path)}")
+
+        except PermissionError: safe_print(f"❌ PERMISSION ERROR: Could not save '{os.path.basename(path)}'. Ensure it is closed.")
+        except Exception as e: safe_print(f"❌ Error updating {path}: {str(e)}")
+
+
+def process_single_row_task(index, row, total_rows, session_map):
+    try:
+        service_name = str(row["Service Name"]).strip()
+        jar_url = str(row["Jfrog Report Link"]).strip()
+        app_code = str(row["Application Code"]).strip()
+        if app_code.lower() == "nan": app_code = ""
+        if not service_name or not jar_url or service_name.lower() == "nan" or jar_url.lower() == "nan": return False
+        download_xray_report(session_map, jar_url, service_name, idx=index, app_code=app_code)
+        return True
+    except Exception as e:
+        safe_print(f"\n❌ Failed [Row {index+1}]: {service_name} - {str(e)}")
+        return False
+
+
+def process_excel(excel_file):
+    print("\nReading Excel...")
+    df = pd.read_excel(excel_file)
+    for column in ["Service Name", "Jfrog Report Link", "Application Code"]:
+        if column not in df.columns: raise Exception(f"Column '{column}' not found in Excel file.")
+
+    session_map = login()
+    success, failure, total_rows = 0, 0, len(df)
+    
+    print(f"\n🚀 Launching {MAX_CONCURRENT_DOWNLOADS} threads for processing {total_rows} records...\n")
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
+        futures = {executor.submit(process_single_row_task, idx, row, total_rows, session_map): idx for idx, row in df.iterrows()}
+        for future in as_completed(futures):
+            if future.result(): success += 1
+            else: failure += 1
+
+    print("\n" + "=" * 70)
+    print(f"DOWNLOAD PHASE COMPLETED | Success: {success} | Failure: {failure}")
+    print("=" * 70)
+
+
+def process_single():
+    jar_url = input("\nPaste Artifactory URL:\n> ").strip()
+    service_name = input("\nEnter Service Name (Required):\n> ").strip()
+    if not service_name: return print("⚠️ Service Name is required.")
+    app_code = input("\nEnter Application Code (Optional):\n> ").strip()
+    
+    session_map = login()
+    try: download_xray_report(session_map, jar_url, service_name, idx=0, app_code=app_code)
+    except Exception as e: print(f"❌ Failed: {str(e)}")
+
+
+def print_final_summary_and_save():
+    print("\n" + "=" * 70)
+    print("FINAL REVALIDATION SUMMARY")
+    print("=" * 70)
+    for tracker, count in CHANGE_SUMMARY.items():
+        if count > 0: print(f"🔄 {tracker.ljust(12)} Tracker : {count} changes made")
+        else: print(f"✅ {tracker.ljust(12)} Tracker : 0 changes made")
+    print("=" * 70)
+
+    if sum(CHANGE_SUMMARY.values()) > 0 and CHANGE_LOGS:
+        print("\nGENERATING DETAILED CHANGE LOG EXCELS...")
+        log_df = pd.DataFrame(CHANGE_LOGS)
+        for app_code, group in log_df.groupby("Application Code"):
+            safe_app_code = clean_filename(app_code) if app_code.strip() else "Uncategorized"
+            os.makedirs(safe_app_code, exist_ok=True)
+            log_path = os.path.join(safe_app_code, "Revalidation_Change_Log.xlsx")
+            try:
+                group.to_excel(log_path, index=False)
+                print(f"✅ Change log saved: {os.path.abspath(log_path)}")
+            except PermissionError: print(f"❌ PERMISSION ERROR: Could not save {log_path}.")
+    else: print("\nℹ️ No detailed change log Excels were generated because no statuses required updating.")
+
+
+def main():
+    print("=" * 70)
+    print("⚡ XRAY SCA BATCH DOWNLOADER & VALIDATOR [HIGH SPEED]")
+    print("=" * 70)
+    choice = input("\n1. Single Download\n2. Excel Bulk Download\nEnter Choice (1/2): ").strip()
+
+    if choice == "1": process_single()
+    elif choice == "2":
+        excel_file = input("\nEnter Excel File Path:\n> ").strip()
+        if os.path.exists(excel_file): process_excel(excel_file)
+        else: print("❌ File not found.")
+    else: return print("❌ Invalid Choice")
+
+    batch_update_master_files()
+    print_final_summary_and_save()
+
+
+if __name__ == "__main__":
+    main()
