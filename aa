@@ -1,0 +1,181 @@
+def generate_xray_report(self, mail_text, application_code):
+        """Extracts JFrog URLs (standard and ue1), authenticates dynamically, and builds HTML report."""
+        mail_text = mail_text.replace("&amp;", "&")
+        
+        # Updated Regex to capture both lower-artifactory and ue1-lower-artifactory
+        urls = re.findall(r"(?i)https://(?:ue1-)?lower-artifactory\.crisil\.local[^\s<>\"']+", mail_text)
+        urls = list(dict.fromkeys(urls))
+        
+        if not urls:
+            return None
+            
+        logging.info(f"Found {len(urls)} JFrog URLs for {application_code}. Initiating Xray scan...")
+        
+        session = requests.Session()
+        session.verify = False
+        common_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+        }
+
+        # Identify unique base URLs present in the extracted links
+        base_urls = set(f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in urls)
+
+        # Log into each unique base URL dynamically
+        try:
+            for base in base_urls:
+                login_response = session.post(
+                    f"{base}/ui/api/v1/access/auth/login?_spring_security_remember_me=false",
+                    headers=common_headers,
+                    json={"username": self.jfrog_user, "password": self.jfrog_pass}
+                )
+                if login_response.status_code != 200:
+                    logging.error(f"JFrog Login Failed for {base}: {login_response.status_code}")
+                    return None
+        except Exception as e:
+            logging.error(f"JFrog Connection Error: {e}")
+            return None
+
+        all_reports = []
+
+        for jfrog_url in urls:
+            try:
+                parsed = urlparse(jfrog_url)
+                current_base_url = f"{parsed.scheme}://{parsed.netloc}"
+                params = parse_qs(parsed.query)
+
+                # 1. Try extracting from query parameters (Old format)
+                package_id = unquote(params.get("package_id", [""])[0])
+                path = unquote(params.get("path", [""])[0])
+                version = unquote(params.get("version", [""])[0])
+
+                # 2. If path is empty, try extracting from the URL path (New format from image)
+                if not path and "/ui/repos/tree/" in parsed.path:
+                    # Example parsed.path: /ui/repos/tree/General/crisil-devsecops-maven-local/pipeline/...
+                    after_tree = parsed.path.split("/ui/repos/tree/", 1)[-1]
+                    tree_parts = after_tree.split("/")
+                    
+                    # tree_parts[0] is the tab name (e.g., 'General', 'Xray')
+                    # The rest is the repo_name/path/to/artifact
+                    if len(tree_parts) > 1:
+                        path = unquote("/".join(tree_parts[1:]))
+
+                if not path or "/" not in path:
+                    logging.warning(f"Could not extract a valid repository path from URL: {jfrog_url}")
+                    continue
+
+                repo, artifact_path = path.split("/", 1)
+                path_tokens = artifact_path.split("/")
+                service_name = path_tokens[5] if len(path_tokens) > 5 else artifact_path
+
+                # Policy API (routed to the correct base URL)
+                policy_payload = {"package_id": package_id, "path": path, "version": version}
+                policy_resp = session.post(f"{current_base_url}/ui/api/v1/xray/ui/userIssues/dashboard/policyViolations", headers=common_headers, json=policy_payload)
+                policy_severity = policy_resp.json().get("severity_count", {}) if policy_resp.status_code == 200 else {}
+
+                # Vulnerability API
+                vuln_payload = {
+                    "package_id": package_id, "path": path, "version": version,
+                    "multiScanId": "", "scanType": "repositories", "isGitRepoMultiscan": False,
+                    "issue_kind": 0, "isGitRepo": False
+                }
+                vuln_resp = session.post(f"{current_base_url}/ui/api/v1/xray/ui/component/dashboard/vulnerabilities", headers=common_headers, json=vuln_payload)
+                vuln_severity = vuln_resp.json().get("severity_count", {}) if vuln_resp.status_code == 200 else {}
+
+                # Artifact Status
+                artifact_resp = session.post(f"{current_base_url}/ui/api/v1/xray/ui/unified/artifact/status", headers=common_headers, json={"path": artifact_path, "repo": repo})
+                artifact_json = artifact_resp.json() if artifact_resp.status_code == 200 else {}
+                
+                sca = artifact_json.get("details", {}).get("sca", {})
+                violations = artifact_json.get("details", {}).get("violations", {})
+
+                all_reports.append({
+                    "service": service_name,
+                    "policy": {
+                        "critical": policy_severity.get("critical", 0),
+                        "high": policy_severity.get("high", 0),
+                        "medium": policy_severity.get("medium", 0),
+                        "low": policy_severity.get("low", 0)
+                    },
+                    "vuln": {
+                        "critical": vuln_severity.get("critical", 0),
+                        "high": vuln_severity.get("high", 0),
+                        "medium": vuln_severity.get("medium", 0),
+                        "low": vuln_severity.get("low", 0)
+                    },
+                    "sca_status": sca.get("status", "N/A"),
+                    "sca_time": self.convert_to_ist(sca.get("time")),
+                    "violation_status": violations.get("status", "N/A"),
+                    "violation_time": self.convert_to_ist(violations.get("time"))
+                })
+            except Exception as ex:
+                logging.warning(f"Error parsing JFrog URL {jfrog_url}: {ex}")
+
+        if not all_reports:
+            return None
+
+        # Build Consolidated Totals
+        grand_totals = {
+            "policy": {"critical": sum(x["policy"]["critical"] for x in all_reports), "high": sum(x["policy"]["high"] for x in all_reports), "medium": sum(x["policy"]["medium"] for x in all_reports), "low": sum(x["policy"]["low"] for x in all_reports)},
+            "vuln": {"critical": sum(x["vuln"]["critical"] for x in all_reports), "high": sum(x["vuln"]["high"] for x in all_reports), "medium": sum(x["vuln"]["medium"] for x in all_reports), "low": sum(x["vuln"]["low"] for x in all_reports)}
+        }
+        overall = {
+            "critical": grand_totals["policy"]["critical"] + grand_totals["vuln"]["critical"],
+            "high": grand_totals["policy"]["high"] + grand_totals["vuln"]["high"],
+            "medium": grand_totals["policy"]["medium"] + grand_totals["vuln"]["medium"],
+            "low": grand_totals["policy"]["low"] + grand_totals["vuln"]["low"]
+        }
+
+        # Generate HTML
+        html_report = f"""
+        <html>
+        <head><title>XRAY Report - {application_code}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+            th, td {{ border: 1px solid #ccc; padding: 8px; text-align: center; }}
+            th {{ background-color: #f2f2f2; }}
+            .critical {{ background: #780000; color: white; }}
+            .high {{ background: #dc0000; color: white; }}
+            .medium {{ background: #fd8c00; color: black; }}
+            .low {{ background: #fdc500; color: black; }}
+            .overall {{ background: #D9EAD3; font-weight: bold; }}
+            hr {{ border: 1px solid #ccc; margin: 30px 0; }}
+        </style>
+        </head>
+        <body>
+        <h2>XRAY Consolidated Scan Report - {application_code}</h2>
+        <h3>CONSOLIDATED EXECUTIVE SUMMARY</h3>
+        <table>
+            <tr><th>Type</th><th class='critical'>Critical</th><th class='high'>High</th><th class='medium'>Medium</th><th class='low'>Low</th></tr>
+            <tr><td>Policy Violations</td><td>{grand_totals['policy']['critical']}</td><td>{grand_totals['policy']['high']}</td><td>{grand_totals['policy']['medium']}</td><td>{grand_totals['policy']['low']}</td></tr>
+            <tr><td>Vulnerabilities</td><td>{grand_totals['vuln']['critical']}</td><td>{grand_totals['vuln']['high']}</td><td>{grand_totals['vuln']['medium']}</td><td>{grand_totals['vuln']['low']}</td></tr>
+            <tr class='overall'><td>Overall Total</td><td>{overall['critical']}</td><td>{overall['high']}</td><td>{overall['medium']}</td><td>{overall['low']}</td></tr>
+        </table>
+        <hr>
+        """
+
+        for report in all_reports:
+            html_report += f"""
+            <h3>Service: {report['service']}</h3>
+            <table>
+                <tr><th>Type</th><th class='critical'>Critical</th><th class='high'>High</th><th class='medium'>Medium</th><th class='low'>Low</th></tr>
+                <tr><td>Policy Violations</td><td>{report['policy']['critical']}</td><td>{report['policy']['high']}</td><td>{report['policy']['medium']}</td><td>{report['policy']['low']}</td></tr>
+                <tr><td>Vulnerabilities</td><td>{report['vuln']['critical']}</td><td>{report['vuln']['high']}</td><td>{report['vuln']['medium']}</td><td>{report['vuln']['low']}</td></tr>
+            </table>
+            <br>
+            """
+        html_report += "</body></html>"
+
+        # Save HTML
+        current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_dir = r'C:\Python\Application\CCB'
+        os.makedirs(output_dir, exist_ok=True)
+        output_html_path = os.path.join(output_dir, f'{application_code}_{current_datetime}_XRAY_Report.html')
+        
+        with open(output_html_path, "w", encoding="utf-8") as report_file:
+            report_file.write(html_report)
+            
+        logging.info(f"JFrog Xray report saved successfully: {output_html_path}")
+        return output_html_path
