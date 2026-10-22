@@ -1,40 +1,54 @@
-import win32com.client  
-import time  
-import os  
+import win32com.client
+import time
+import os
+import io
 import csv
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 import requests
 import urllib3
 from urllib.parse import urlparse, parse_qs, unquote
-from datetime import datetime  
-import pytz  
+from datetime import datetime
+import pytz
 from zoneinfo import ZoneInfo
-import logging  
-import pandas as pd  
-import warnings  
-import smtplib  
-from email.mime.multipart import MIMEMultipart  
-from email.mime.text import MIMEText  
+import logging
+import pandas as pd
+import warnings
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from selenium import webdriver
 
 # Suppress warnings for self-signed certificates and Excel modules
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")  
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')  
-  
-class EmailProcessor:  
-    def __init__(self):  
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+class EmailProcessor:
+    def __init__(self):
         self.startup_time = datetime.now(pytz.UTC)
         logging.info(f"Script started at: {self.startup_time} (UTC)")
-        
+
         self.processed_entry_ids = set()
         self.csv_log_file = "processed_emails_log.csv"
         self._initialize_csv_log()
-        
+
         # JFrog Credentials
         self.jfrog_user = "c-EltonC"
         self.jfrog_pass = "Vapt@1810*())(*"
+
+        # Persistent JFrog HTTP Session (reused across all Outlook emails and Excel rows)
+        self.jfrog_session = requests.Session()
+        self.jfrog_session.verify = False
+        self.is_sso_authenticated = False
+        self.common_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+        }
 
     def _initialize_csv_log(self):
         if not os.path.exists(self.csv_log_file):
@@ -65,142 +79,41 @@ class EmailProcessor:
         except Exception:
             return utc_time_str
 
-    def _send_request_with_retry(self, session, method, url, headers, json_payload=None, max_retries=3, delay=1.5):
-        """Executes HTTP requests with retry on transient errors and immediate return on valid/client responses."""
-        for attempt in range(1, max_retries + 1):
-            try:
-                if method.upper() == "POST":
-                    resp = session.post(url, headers=headers, json=json_payload, timeout=25, verify=False)
-                else:
-                    resp = session.get(url, headers=headers, timeout=25, verify=False)
-                
-                if resp.status_code == 200 or (400 <= resp.status_code < 500):
-                    return resp
+    def ensure_jfrog_authentication(self, base_urls, force_reauth=False):
+        """Authenticates via Edge SSO once and reuses self.jfrog_session for all subsequent calls.
+        Re-authenticates only if never authenticated, validation fails, or force_reauth is True."""
+        if not base_urls:
+            return False
 
-                logging.warning(f"[Retry {attempt}/{max_retries}] Status {resp.status_code} for {url}. Waiting {delay}s...")
-            except requests.RequestException as e:
-                logging.warning(f"[Retry {attempt}/{max_retries}] Exception for {url}: {e}. Waiting {delay}s...")
-            
-            time.sleep(delay)
-        return None
+        # Check if existing session is already authenticated and valid across all requested base_urls
+        if self.is_sso_authenticated and not force_reauth:
+            session_valid = True
+            for base in base_urls:
+                try:
+                    resp = self.jfrog_session.get(
+                        f"{base}/ui/",
+                        headers=self.common_headers,
+                        verify=False,
+                        allow_redirects=True,
+                        timeout=10
+                    )
+                    if resp.status_code != 200 or not self.jfrog_session.cookies:
+                        session_valid = False
+                        break
+                except Exception:
+                    session_valid = False
+                    break
 
-    def _resolve_component_metadata(self, session, current_base_url, repo, artifact_path, path, headers):
-        """Resolves package_id, version, and component_id for Tree URLs using storage properties and Xray APIs."""
-        package_id, version, component_id = "", "", ""
-
-        # Method 1: Artifactory storage properties API with basic authentication
-        storage_url = f"{current_base_url}/artifactory/api/storage/{repo}/{artifact_path}?properties"
-        try:
-            resp = session.get(
-                storage_url,
-                headers={"Accept": "application/json"},
-                auth=(self.jfrog_user, self.jfrog_pass),
-                verify=False,
-                timeout=12
-            )
-            if resp.status_code == 200:
-                props = resp.json().get("properties", {})
-                gav_list = props.get("artifactory.gav") or props.get("gav")
-                if gav_list:
-                    gav = gav_list[0]
-                    parts = gav.split(":")
-                    if len(parts) >= 3:
-                        package_id = f"gav://{parts[0]}:{parts[1]}"
-                        version = ":".join(parts[2:])
-                        component_id = f"gav://{gav}"
-                        logging.info(f"Resolved from Storage API (Basic Auth): {component_id}")
-                        return package_id, version, component_id
-        except Exception as ex:
-            logging.debug(f"Storage API with basic auth failed: {ex}")
-
-        # Method 2: Storage properties with session cookies & bearer token
-        try:
-            resp = session.get(storage_url, headers=headers, verify=False, timeout=12)
-            if resp.status_code == 200:
-                props = resp.json().get("properties", {})
-                gav_list = props.get("artifactory.gav") or props.get("gav")
-                if gav_list:
-                    gav = gav_list[0]
-                    parts = gav.split(":")
-                    if len(parts) >= 3:
-                        package_id = f"gav://{parts[0]}:{parts[1]}"
-                        version = ":".join(parts[2:])
-                        component_id = f"gav://{gav}"
-                        logging.info(f"Resolved from Storage API (Session): {component_id}")
-                        return package_id, version, component_id
-        except Exception as ex:
-            logging.debug(f"Storage API with session failed: {ex}")
-
-        # Method 3: Xray UI Artifact Details endpoint
-        details_url = f"{current_base_url}/ui/api/v1/xray/ui/artifact/details"
-        for payload in [{"repo": repo, "path": artifact_path}, {"repo": repo, "path": path}]:
-            try:
-                resp = session.post(details_url, headers=headers, json=payload, verify=False, timeout=10)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    cid = data.get("component_id") or data.get("general", {}).get("component_id")
-                    if cid:
-                        component_id = cid
-                        if ":" in cid:
-                            package_id = cid.rsplit(":", 1)[0]
-                            version = cid.rsplit(":", 1)[1]
-                        logging.info(f"Resolved from Xray Artifact Details: {component_id}")
-                        return package_id, version, component_id
-            except Exception:
-                pass
-
-        # Method 4: Heuristic parsing from path and filename
-        filename = os.path.basename(artifact_path)
-        m = re.match(r"^(.+?)-(\d+\..+?)\.(jar|war|zip|tar\.gz|ear)$", filename)
-        if m:
-            art_id = m.group(1)
-            v_val = m.group(2)
-            if "com/crisil" in artifact_path:
-                idx = artifact_path.find("com/crisil")
-                after = artifact_path[idx:].split("/")
-                grp = ".".join(after[:-1])
+            if session_valid:
+                logging.info("Reusing existing authenticated JFrog SSO session.")
+                return True
             else:
-                grp = "com.crisil"
-            package_id = f"gav://{grp}:{art_id}"
-            version = v_val
-            component_id = f"gav://{grp}:{art_id}:{v_val}"
-            logging.info(f"Resolved via path heuristic: {component_id}")
+                logging.warning("Existing JFrog session appears expired or invalid. Re-authenticating via Edge...")
 
-        return package_id, version, component_id
-
-    def generate_xray_report(self, mail_text, application_code):
-        """Extracts JFrog URLs, authenticates dynamically, and builds clean HTML report supporting both URL formats."""
-        mail_text = mail_text.replace("&amp;", "&")
-        
-        # Capture both lower-artifactory and ue1-lower-artifactory
-        raw_urls = re.findall(r"(?i)https://(?:ue1-)?lower-artifactory\.crisil\.local[^\s<>\"']+", mail_text)
-        
-        urls = []
-        for u in raw_urls:
-            cleaned = u.rstrip(".,;:)>]'\"")
-            if cleaned not in urls:
-                urls.append(cleaned)
-        
-        if not urls:
-            return None
-            
-        logging.info(f"Found {len(urls)} JFrog URLs for {application_code}. Initiating Xray scan...")
-        
-        session = requests.Session()
-        session.verify = False
-        common_headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.199 Safari/537.36"
-        }
-
-        base_urls = set(f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in urls)
-
-        # Authenticate once using Edge SSO
+        # Perform interactive Edge SSO login once
         try:
             driver = webdriver.Edge()
-            first_base = list(base_urls)[0]
+            first_base = sorted(list(base_urls))[0]
 
             driver.get(first_base)
 
@@ -212,35 +125,337 @@ class EmailProcessor:
             selenium_cookies = driver.get_cookies()
             driver.quit()
 
-            access_token = None
+            # Clear stale cookies and copy fresh browser cookies into the persistent session
+            self.jfrog_session.cookies.clear()
             for cookie in selenium_cookies:
-                c_name = cookie["name"]
-                c_val = cookie["value"]
-                session.cookies.set(c_name, c_val)
-                for base in base_urls:
-                    session.cookies.set(c_name, c_val, domain=urlparse(base).netloc)
-                if c_name == "ACCESSTOKEN":
-                    access_token = c_val
+                self.jfrog_session.cookies.set(cookie["name"], cookie["value"])
 
-            if access_token:
-                common_headers["Authorization"] = f"Bearer {access_token}"
-
+            # Validate the session against all JFrog instances
             for base in base_urls:
-                validation_response = session.get(
+                validation_response = self.jfrog_session.get(
                     f"{base}/ui/",
-                    headers=common_headers,
+                    headers=self.common_headers,
                     verify=False,
-                    allow_redirects=True
+                    allow_redirects=True,
+                    timeout=15
                 )
+
                 if validation_response.status_code != 200:
-                    logging.error(f"JFrog Authentication Failed for {base}: {validation_response.status_code}")
-                    return None
+                    logging.error(
+                        f"JFrog Authentication Failed for {base}: "
+                        f"{validation_response.status_code}"
+                    )
+                    self.is_sso_authenticated = False
+                    return False
+
                 logging.info(f"JFrog Authentication Successful: {base}")
+
+            self.is_sso_authenticated = True
+            return True
 
         except Exception as e:
             logging.error(f"JFrog Connection Error: {e}")
+            self.is_sso_authenticated = False
+            return False
+
+    def _parse_filename_artifact_and_version(self, filename):
+        """Splits an artifact filename (e.g. nprintservice-0.0.1-SNAPSHOT.jar or crisil-commons.ui.apps-2.3.12.zip)
+        into (artifact_id, version, extension)."""
+        base_name, ext = os.path.splitext(filename)
+        ext = ext.lstrip(".").lower()
+
+        match = re.match(r"^(?P<artifact>.+?)-(?P<version>\d+(?:\.\d+)*(?:-[A-Za-z0-9._-]+)?)$", base_name)
+        if match:
+            return match.group("artifact"), match.group("version"), ext
+        return base_name, "", ext
+
+    def _parse_pom_xml_bytes(self, xml_bytes):
+        """Extracts groupId, artifactId, and raw version (including ${build.version}) from pom.xml bytes."""
+        try:
+            root = ET.fromstring(xml_bytes)
+            ns = ""
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+
+            def find_text(elem, tag):
+                node = elem.find(f"{ns}{tag}")
+                return node.text.strip() if node is not None and node.text else ""
+
+            parent = root.find(f"{ns}parent")
+            group_id = find_text(root, "groupId") or (find_text(parent, "groupId") if parent is not None else "")
+            artifact_id = find_text(root, "artifactId")
+            version = find_text(root, "version") or (find_text(parent, "version") if parent is not None else "")
+
+            props = {}
+            props_node = root.find(f"{ns}properties")
+            if props_node is not None:
+                for child in list(props_node):
+                    tag_name = child.tag.split("}")[-1]
+                    if child.text:
+                        props[tag_name] = child.text.strip()
+
+            return group_id, artifact_id, version, props
+        except Exception:
+            return "", "", "", {}
+
+    def _inspect_artifact_pom_metadata(self, session, base_url, repo, artifact_path, headers):
+        """Attempts to discover exact Maven GAV metadata via Artifactory Storage Properties,
+        adjacent .pom files, or META-INF/maven/.../pom.xml inside the archive."""
+        discovered = []
+
+        # 1. Check Artifactory Storage Properties API
+        try:
+            prop_url = f"{base_url}/artifactory/api/storage/{repo}/{artifact_path}?properties"
+            prop_resp = session.get(prop_url, headers=headers, verify=False, timeout=10)
+            if prop_resp.status_code == 200:
+                props = prop_resp.json().get("properties", {})
+                if "artifactory.gav" in props and props["artifactory.gav"]:
+                    gav_val = props["artifactory.gav"][0]
+                    parts = gav_val.split(":")
+                    if len(parts) >= 3:
+                        pkg = f"gav://{parts[0]}:{parts[1]}"
+                        ver = parts[2]
+                        discovered.append((pkg, ver))
+
+                g_id = (props.get("maven.groupId") or props.get("pom.groupId") or [""])[0]
+                a_id = (props.get("maven.artifactId") or props.get("pom.artifactId") or [""])[0]
+                ver = (props.get("maven.version") or props.get("pom.version") or [""])[0]
+                if g_id and a_id and ver:
+                    discovered.append((f"gav://{g_id}:{a_id}", ver))
+        except Exception as e:
+            logging.debug(f"Storage properties lookup skipped for {artifact_path}: {e}")
+
+        # 2. Check if an adjacent .pom file exists in Artifactory
+        try:
+            base_no_ext, ext = os.path.splitext(artifact_path)
+            if ext.lower() in [".jar", ".war", ".zip", ".ear"]:
+                pom_url = f"{base_url}/artifactory/{repo}/{base_no_ext}.pom"
+                pom_resp = session.get(pom_url, headers=headers, verify=False, timeout=10)
+                if pom_resp.status_code == 200 and b"<project" in pom_resp.content:
+                    g_id, a_id, ver, _ = self._parse_pom_xml_bytes(pom_resp.content)
+                    if g_id and a_id and ver:
+                        discovered.append((f"gav://{g_id}:{a_id}", ver))
+        except Exception as e:
+            logging.debug(f"Adjacent POM lookup skipped for {artifact_path}: {e}")
+
+        # 3. Inspect internal META-INF/maven/.../pom.xml & pom.properties inside .jar/.zip/.war
+        try:
+            _, ext = os.path.splitext(artifact_path)
+            if ext.lower() in [".jar", ".war", ".zip"]:
+                download_url = f"{base_url}/artifactory/{repo}/{artifact_path}"
+                head_resp = session.head(download_url, headers=headers, verify=False, allow_redirects=True, timeout=10)
+                content_length = int(head_resp.headers.get("Content-Length", 0) or 0)
+
+                if 0 < content_length <= 80 * 1024 * 1024:
+                    dl_resp = session.get(download_url, headers=headers, verify=False, timeout=25)
+                    if dl_resp.status_code == 200:
+                        with zipfile.ZipFile(io.BytesIO(dl_resp.content)) as zf:
+                            namelist = zf.namelist()
+                            for name in namelist:
+                                if name.startswith("META-INF/maven/") and name.endswith("/pom.xml"):
+                                    g_id, a_id, ver, _ = self._parse_pom_xml_bytes(zf.read(name))
+                                    if g_id and a_id and ver:
+                                        discovered.append((f"gav://{g_id}:{a_id}", ver))
+                            for name in namelist:
+                                if name.startswith("META-INF/maven/") and name.endswith("/pom.properties"):
+                                    prop_text = zf.read(name).decode("utf-8", errors="ignore")
+                                    p_map = {}
+                                    for line in prop_text.splitlines():
+                                        if "=" in line and not line.strip().startswith("#"):
+                                            k, v = line.split("=", 1)
+                                            p_map[k.strip()] = v.strip()
+                                    if p_map.get("groupId") and p_map.get("artifactId") and p_map.get("version"):
+                                        discovered.append((f"gav://{p_map['groupId']}:{p_map['artifactId']}", p_map["version"]))
+        except Exception as e:
+            logging.debug(f"Archive META-INF inspection skipped for {artifact_path}: {e}")
+
+        return discovered
+
+    def resolve_xray_candidates(self, session, base_url, repo, artifact_path, query_pkg_id, query_version, artifact_status_json, headers):
+        """Builds an ordered list of unique (package_id, version) candidate pairs to query Xray."""
+        candidates = []
+
+        def add_candidate(pkg, ver):
+            if pkg and ver and (pkg, ver) not in candidates:
+                candidates.append((pkg, ver))
+
+        # 1. Explicit URL query parameters (highest priority if present)
+        if query_pkg_id and query_version:
+            add_candidate(query_pkg_id, query_version)
+
+        # 2. Check if unified/artifact/status response contains package metadata
+        if isinstance(artifact_status_json, dict):
+            for section_key in ["overall", "details"]:
+                sec = artifact_status_json.get(section_key, {})
+                if isinstance(sec, dict):
+                    s_pkg = sec.get("package_id") or sec.get("component_id")
+                    s_ver = sec.get("version")
+                    if s_pkg and s_ver:
+                        add_candidate(s_pkg, s_ver)
+
+        # 3. Inspect Artifactory Storage properties, .pom, and internal META-INF/maven
+        pom_candidates = self._inspect_artifact_pom_metadata(session, base_url, repo, artifact_path, headers)
+        for pkg, ver in pom_candidates:
+            add_candidate(pkg, ver)
+
+        # 4. Heuristic construction from path and filename
+        path_parts = [p for p in artifact_path.split("/") if p]
+        filename = path_parts[-1] if path_parts else artifact_path
+        artifact_id, file_version, _ = self._parse_filename_artifact_and_version(filename)
+
+        version_candidates = []
+        if query_version:
+            version_candidates.append(query_version)
+        for _, ver in pom_candidates:
+            if ver not in version_candidates:
+                version_candidates.append(ver)
+        if file_version and file_version not in version_candidates:
+            version_candidates.append(file_version)
+        for placeholder in ["${build.version}", "${project.version}", "${revision}"]:
+            if placeholder not in version_candidates:
+                version_candidates.append(placeholder)
+
+        group_candidates = []
+        dir_parts = path_parts[:-1]
+        if dir_parts and dir_parts[0] in ("com", "org", "io", "net", "in"):
+            trimmed_dirs = list(dir_parts)
+            if trimmed_dirs and file_version and trimmed_dirs[-1] == file_version:
+                trimmed_dirs.pop()
+            if trimmed_dirs and trimmed_dirs[-1] == artifact_id:
+                trimmed_dirs.pop()
+            if trimmed_dirs:
+                group_candidates.append(".".join(trimmed_dirs))
+
+        for g in ["com.crisil", "com.crisil.www", "crisil"]:
+            if g not in group_candidates:
+                group_candidates.append(g)
+
+        if len(dir_parts) >= 5 and dir_parts[0].lower() == "pipeline":
+            service_folder = re.sub(r"[^a-zA-Z0-9]", "", dir_parts[4]).lower()
+            if service_folder:
+                group_candidates.append(f"com.crisil.{service_folder}")
+
+        for g_id in group_candidates:
+            pkg_id = f"gav://{g_id}:{artifact_id}"
+            for ver in version_candidates:
+                add_candidate(pkg_id, ver)
+
+        return candidates
+
+    def query_xray_with_fallback(self, session, base_url, repo, full_path, candidates, headers):
+        """Tests candidate (package_id, version) pairs against Xray vulnerabilities and policyViolations
+        endpoints using both modern (with repo & component_id) and legacy payload schemas."""
+        vuln_url = f"{base_url}/ui/api/v1/xray/ui/component/dashboard/vulnerabilities"
+        policy_url = f"{base_url}/ui/api/v1/xray/ui/userIssues/dashboard/policyViolations"
+
+        best_vuln_severity = {}
+        best_policy_severity = {}
+        matched_candidate = None
+
+        for pkg_id, ver in candidates:
+            comp_id = f"{pkg_id}:{ver}"
+
+            modern_vuln_payload = {
+                "repo": repo,
+                "path": full_path,
+                "package_id": pkg_id,
+                "version": ver,
+                "component_id": comp_id,
+                "issue_kind": 0
+            }
+            legacy_vuln_payload = {
+                "package_id": pkg_id,
+                "path": full_path,
+                "version": ver,
+                "multiScanId": "",
+                "scanType": "repositories",
+                "isGitRepoMultiscan": False,
+                "issue_kind": 0,
+                "isGitRepo": False
+            }
+
+            for v_payload in (modern_vuln_payload, legacy_vuln_payload):
+                try:
+                    v_resp = session.post(vuln_url, headers=headers, json=v_payload, verify=False, timeout=15)
+                    if v_resp.status_code == 200:
+                        v_json = v_resp.json()
+                        sev = v_json.get("severity_count", {})
+                        app_cnt = v_json.get("applicability_count", {})
+
+                        total_sev = sum(sev.get(k, 0) for k in ("critical", "high", "medium", "low"))
+                        total_app = sum(app_cnt.values()) if isinstance(app_cnt, dict) else 0
+
+                        if matched_candidate is None and "severity_count" in v_json:
+                            best_vuln_severity = sev
+                            matched_candidate = (pkg_id, ver)
+
+                        if total_sev > 0 or total_app > 0:
+                            best_vuln_severity = sev
+                            matched_candidate = (pkg_id, ver)
+                            break
+                except Exception as e:
+                    logging.debug(f"Vulnerability query attempt failed for {comp_id}: {e}")
+
+            if matched_candidate == (pkg_id, ver) and sum(best_vuln_severity.get(k, 0) for k in ("critical", "high", "medium", "low")) > 0:
+                break
+
+        target_pkg, target_ver = matched_candidate if matched_candidate else (candidates[0] if candidates else ("", ""))
+        if target_pkg or full_path:
+            target_comp = f"{target_pkg}:{target_ver}" if target_pkg and target_ver else ""
+            policy_payloads = [
+                {
+                    "repo": repo,
+                    "path": full_path,
+                    "package_id": target_pkg,
+                    "version": target_ver,
+                    "component_id": target_comp
+                },
+                {
+                    "package_id": target_pkg,
+                    "path": full_path,
+                    "version": target_ver
+                }
+            ]
+            for p_payload in policy_payloads:
+                try:
+                    p_resp = session.post(policy_url, headers=headers, json=p_payload, verify=False, timeout=15)
+                    if p_resp.status_code == 200:
+                        p_json = p_resp.json()
+                        sev = p_json.get("severity_count", {})
+                        if sev:
+                            best_policy_severity = sev
+                            if sum(sev.get(k, 0) for k in ("critical", "high", "medium", "low")) > 0:
+                                break
+                except Exception as e:
+                    logging.debug(f"Policy query attempt failed for {target_comp}: {e}")
+
+        if matched_candidate:
+            logging.info(f"Resolved Xray metadata for '{full_path}' -> package_id='{matched_candidate[0]}', version='{matched_candidate[1]}'")
+
+        return best_policy_severity, best_vuln_severity
+
+    def generate_xray_report(self, mail_text, application_code):
+        """Extracts JFrog URLs (standard and ue1), authenticates once (reusing session), and builds HTML report."""
+        mail_text = mail_text.replace("&amp;", "&")
+
+        # Capture both lower-artifactory and ue1-lower-artifactory URLs
+        urls = re.findall(r"(?i)https://(?:ue1-)?lower-artifactory\.crisil\.local[^\s<>\"']+", mail_text)
+        urls = list(dict.fromkeys(urls))
+
+        if not urls:
             return None
 
+        logging.info(f"Found {len(urls)} JFrog URLs for {application_code}. Initiating Xray scan...")
+
+        # Identify unique base URLs present in the extracted links
+        base_urls = set(f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in urls)
+
+        # Authenticate once via Edge SSO or reuse existing authenticated session
+        if not self.ensure_jfrog_authentication(base_urls):
+            return None
+
+        session = self.jfrog_session
+        common_headers = self.common_headers
         all_reports = []
 
         for jfrog_url in urls:
@@ -249,133 +464,74 @@ class EmailProcessor:
                 current_base_url = f"{parsed.scheme}://{parsed.netloc}"
                 params = parse_qs(parsed.query)
 
-                # Prepare request headers with Origin and Referer to satisfy CSRF protection
-                req_headers = dict(common_headers)
-                req_headers["Origin"] = current_base_url
-                req_headers["Referer"] = jfrog_url
-
-                # Condition 1: Legacy query-string parameters
+                # 1. Try extracting from query parameters (Old format)
                 package_id = unquote(params.get("package_id", [""])[0])
                 path = unquote(params.get("path", [""])[0])
                 version = unquote(params.get("version", [""])[0])
-                component_id = unquote(params.get("component_id", [""])[0])
 
-                # Condition 2: Tree-view URLs (/ui/repos/tree/...)
+                # 2. If path is empty, extract from URL path (Tree format: /ui/repos/tree/<Tab>/<repo>/<artifact_path>)
                 if not path and "/ui/repos/tree/" in parsed.path:
                     after_tree = parsed.path.split("/ui/repos/tree/", 1)[-1]
-                    tree_parts = [p for p in after_tree.split("/") if p]
-                    
-                    if tree_parts:
-                        if tree_parts[0].lower() in ['general', 'xray', 'properties', 'builds', 'releasebundles']:
-                            path = unquote("/".join(tree_parts[1:]))
-                        else:
-                            path = unquote("/".join(tree_parts))
+                    tree_parts = after_tree.split("/")
+
+                    if len(tree_parts) > 1:
+                        path = unquote("/".join(tree_parts[1:]))
 
                 if not path or "/" not in path:
                     logging.warning(f"Could not extract a valid repository path from URL: {jfrog_url}")
                     continue
 
                 repo, artifact_path = path.split("/", 1)
-                path_tokens = artifact_path.split("/")
-                
-                # Service name identification
-                if "pipeline" in path_tokens and "build" in path_tokens:
-                    try:
-                        b_idx = path_tokens.index("build")
-                        service_name = path_tokens[b_idx + 1]
-                    except Exception:
-                        service_name = path_tokens[5] if len(path_tokens) > 5 else os.path.basename(artifact_path)
-                elif len(path_tokens) > 5:
-                    service_name = path_tokens[5]
+                path_tokens = [t for t in artifact_path.split("/") if t]
+
+                if len(path_tokens) > 5 and path_tokens[0].lower() == "pipeline":
+                    service_name = f"{path_tokens[4]} ({path_tokens[-1]})" if path_tokens[5].isdigit() else path_tokens[5]
                 else:
-                    service_name = os.path.basename(artifact_path)
+                    service_name = path_tokens[-1] if path_tokens else artifact_path
 
-                # Resolve metadata dynamically if not provided in URL
-                if not component_id or not package_id or not version:
-                    pkg_id_dyn, ver_dyn, comp_id_dyn = self._resolve_component_metadata(
-                        session, current_base_url, repo, artifact_path, path, req_headers
-                    )
-                    package_id = package_id or pkg_id_dyn
-                    version = version or ver_dyn
-                    component_id = component_id or comp_id_dyn
-
-                if component_id and (not package_id or not version):
-                    if ":" in component_id:
-                        p_id, v_val = component_id.rsplit(":", 1)
-                        package_id = package_id or p_id
-                        version = version or v_val
-                elif not component_id and package_id and version:
-                    component_id = f"{package_id}:{version}"
-
-                logging.info(f"Target Artifact: {artifact_path} | Component: {component_id} | Package: {package_id} | Version: {version}")
-
-                # Fetch artifact scan status
-                artifact_status_url = f"{current_base_url}/ui/api/v1/xray/ui/unified/artifact/status"
-                artifact_resp = self._send_request_with_retry(
-                    session, "POST", artifact_status_url, req_headers, {"path": artifact_path, "repo": repo}
+                # 3. Query Artifact Status (and auto-recover if SSO token expired mid-run)
+                artifact_resp = session.post(
+                    f"{current_base_url}/ui/api/v1/xray/ui/unified/artifact/status",
+                    headers=common_headers,
+                    json={"path": artifact_path, "repo": repo},
+                    verify=False
                 )
-                artifact_json = artifact_resp.json() if artifact_resp and artifact_resp.status_code == 200 else {}
+
+                if artifact_resp.status_code in (401, 403):
+                    logging.warning(f"JFrog session token expired (HTTP {artifact_resp.status_code}). Refreshing SSO session...")
+                    if self.ensure_jfrog_authentication(base_urls, force_reauth=True):
+                        artifact_resp = session.post(
+                            f"{current_base_url}/ui/api/v1/xray/ui/unified/artifact/status",
+                            headers=common_headers,
+                            json={"path": artifact_path, "repo": repo},
+                            verify=False
+                        )
+
+                artifact_json = artifact_resp.json() if artifact_resp.status_code == 200 else {}
+
+                # 4. Resolve candidate (package_id, version) pairs and query Xray APIs
+                candidates = self.resolve_xray_candidates(
+                    session=session,
+                    base_url=current_base_url,
+                    repo=repo,
+                    artifact_path=artifact_path,
+                    query_pkg_id=package_id,
+                    query_version=version,
+                    artifact_status_json=artifact_json,
+                    headers=common_headers
+                )
+
+                policy_severity, vuln_severity = self.query_xray_with_fallback(
+                    session=session,
+                    base_url=current_base_url,
+                    repo=repo,
+                    full_path=path,
+                    candidates=candidates,
+                    headers=common_headers
+                )
+
                 sca = artifact_json.get("details", {}).get("sca", {})
                 violations = artifact_json.get("details", {}).get("violations", {})
-
-                # 1. Query Policy Violations API
-                policy_url = f"{current_base_url}/ui/api/v1/xray/ui/userIssues/dashboard/policyViolations"
-                policy_payload = {
-                    "repo": repo,
-                    "path": path,
-                    "package_id": package_id,
-                    "version": version,
-                    "component_id": component_id
-                }
-                policy_resp = self._send_request_with_retry(session, "POST", policy_url, req_headers, policy_payload)
-                
-                if not policy_resp or policy_resp.status_code != 200:
-                    policy_payload_legacy = {"package_id": package_id, "path": path, "version": version}
-                    policy_resp = self._send_request_with_retry(session, "POST", policy_url, req_headers, policy_payload_legacy)
-
-                policy_severity = policy_resp.json().get("severity_count", {}) if policy_resp and policy_resp.status_code == 200 else {}
-
-                # 2. Query Vulnerabilities API
-                vuln_url = f"{current_base_url}/ui/api/v1/xray/ui/component/dashboard/vulnerabilities"
-                vuln_payload = {
-                    "repo": repo,
-                    "path": path,
-                    "package_id": package_id,
-                    "version": version,
-                    "component_id": component_id,
-                    "issue_kind": 0
-                }
-                vuln_resp = self._send_request_with_retry(session, "POST", vuln_url, req_headers, vuln_payload)
-
-                if not vuln_resp or vuln_resp.status_code != 200:
-                    vuln_payload_legacy = {
-                        "package_id": package_id, "path": path, "version": version,
-                        "multiScanId": "", "scanType": "repositories", "isGitRepoMultiscan": False,
-                        "issue_kind": 0, "isGitRepo": False
-                    }
-                    vuln_resp = self._send_request_with_retry(session, "POST", vuln_url, req_headers, vuln_payload_legacy)
-
-                vuln_severity = vuln_resp.json().get("severity_count", {}) if vuln_resp and vuln_resp.status_code == 200 else {}
-
-                # Fallback: If 0 findings and version had a Maven property like ${build.version}, retry with filename version
-                if not any(vuln_severity.values()):
-                    filename = os.path.basename(artifact_path)
-                    ver_match = re.search(r"-(\d+\.\d+[\w\.\-]*)\.(jar|war|zip|tar\.gz)$", filename)
-                    if ver_match and version != ver_match.group(1):
-                        alt_ver = ver_match.group(1)
-                        alt_comp = f"{package_id}:{alt_ver}"
-                        alt_payload = {
-                            "repo": repo, "path": path, "package_id": package_id,
-                            "version": alt_ver, "component_id": alt_comp, "issue_kind": 0
-                        }
-                        alt_resp = self._send_request_with_retry(session, "POST", vuln_url, req_headers, alt_payload)
-                        if alt_resp and alt_resp.status_code == 200:
-                            alt_sev = alt_resp.json().get("severity_count", {})
-                            if any(alt_sev.values()):
-                                vuln_severity = alt_sev
-                                logging.info(f"Extracted findings using alternative version: {alt_ver}")
-
-                logging.info(f"Result for {service_name} -> Policy: {policy_severity} | Vuln: {vuln_severity}")
 
                 all_reports.append({
                     "service": service_name,
@@ -424,31 +580,31 @@ class EmailProcessor:
             "low": grand_totals["policy"]["low"] + grand_totals["vuln"]["low"]
         }
 
-        # Generate Clean HTML
+        # Generate HTML
         html_report = f"""
         <html>
         <head><title>XRAY Report - {application_code}</title>
         <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
-            th, td {{ border: 1px solid #ccc; padding: 8px; text-align: center; }}
-            th {{ background-color: #f2f2f2; }}
-            .critical {{ background: #780000; color: white; }}
-            .high {{ background: #dc0000; color: white; }}
-            .medium {{ background: #fd8c00; color: black; }}
-            .low {{ background: #fdc500; color: black; }}
-            .overall {{ background: #D9EAD3; font-weight: bold; }}
-            hr {{ border: 1px solid #ccc; margin: 30px 0; }}
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+        th, td {{ border: 1px solid #ccc; padding: 8px; text-align: center; }}
+        th {{ background-color: #f2f2f2; }}
+        .critical {{ background: #780000; color: white; }}
+        .high {{ background: #dc0000; color: white; }}
+        .medium {{ background: #fd8c00; color: black; }}
+        .low {{ background: #fdc500; color: black; }}
+        .overall {{ background: #D9EAD3; font-weight: bold; }}
+        hr {{ border: 1px solid #ccc; margin: 30px 0; }}
         </style>
         </head>
         <body>
         <h2>XRAY Consolidated Scan Report - {application_code}</h2>
         <h3>CONSOLIDATED EXECUTIVE SUMMARY</h3>
         <table>
-            <tr><th>Type</th><th class='critical'>Critical</th><th class='high'>High</th><th class='medium'>Medium</th><th class='low'>Low</th></tr>
-            <tr><td>Policy Violations</td><td>{grand_totals['policy']['critical']}</td><td>{grand_totals['policy']['high']}</td><td>{grand_totals['policy']['medium']}</td><td>{grand_totals['policy']['low']}</td></tr>
-            <tr><td>Vulnerabilities</td><td>{grand_totals['vuln']['critical']}</td><td>{grand_totals['vuln']['high']}</td><td>{grand_totals['vuln']['medium']}</td><td>{grand_totals['vuln']['low']}</td></tr>
-            <tr class='overall'><td>Overall Total</td><td>{overall['critical']}</td><td>{overall['high']}</td><td>{overall['medium']}</td><td>{overall['low']}</td></tr>
+        <tr><th>Type</th><th class='critical'>Critical</th><th class='high'>High</th><th class='medium'>Medium</th><th class='low'>Low</th></tr>
+        <tr><td>Policy Violations</td><td>{grand_totals['policy']['critical']}</td><td>{grand_totals['policy']['high']}</td><td>{grand_totals['policy']['medium']}</td><td>{grand_totals['policy']['low']}</td></tr>
+        <tr><td>Vulnerabilities</td><td>{grand_totals['vuln']['critical']}</td><td>{grand_totals['vuln']['high']}</td><td>{grand_totals['vuln']['medium']}</td><td>{grand_totals['vuln']['low']}</td></tr>
+        <tr class='overall'><td>Overall Total</td><td>{overall['critical']}</td><td>{overall['high']}</td><td>{overall['medium']}</td><td>{overall['low']}</td></tr>
         </table>
         <hr>
         """
@@ -457,93 +613,94 @@ class EmailProcessor:
             html_report += f"""
             <h3>Service: {report['service']}</h3>
             <table>
-                <tr><th>Type</th><th class='critical'>Critical</th><th class='high'>High</th><th class='medium'>Medium</th><th class='low'>Low</th></tr>
-                <tr><td>Policy Violations</td><td>{report['policy']['critical']}</td><td>{report['policy']['high']}</td><td>{report['policy']['medium']}</td><td>{report['policy']['low']}</td></tr>
-                <tr><td>Vulnerabilities</td><td>{report['vuln']['critical']}</td><td>{report['vuln']['high']}</td><td>{report['vuln']['medium']}</td><td>{report['vuln']['low']}</td></tr>
+            <tr><th>Type</th><th class='critical'>Critical</th><th class='high'>High</th><th class='medium'>Medium</th><th class='low'>Low</th></tr>
+            <tr><td>Policy Violations</td><td>{report['policy']['critical']}</td><td>{report['policy']['high']}</td><td>{report['policy']['medium']}</td><td>{report['policy']['low']}</td></tr>
+            <tr><td>Vulnerabilities</td><td>{report['vuln']['critical']}</td><td>{report['vuln']['high']}</td><td>{report['vuln']['medium']}</td><td>{report['vuln']['low']}</td></tr>
             </table>
             <br>
             """
         html_report += "</body></html>"
 
+        # Save HTML
         current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         output_dir = r'C:\CCB'
         os.makedirs(output_dir, exist_ok=True)
         output_html_path = os.path.join(output_dir, f'{application_code}_{current_datetime}_XRAY_Report.html')
-        
+
         with open(output_html_path, "w", encoding="utf-8") as report_file:
             report_file.write(html_report)
-            
+
         logging.info(f"JFrog Xray report saved successfully: {output_html_path}")
         return output_html_path
-  
-    def filter_and_save_report(self, report_config, application_code):  
+
+    def filter_and_save_report(self, report_config, application_code):
         """Processes sections and returns a tuple: (output_html_path, application_name_found, is_present)"""
         report_name = report_config['report_name']
         sections = report_config['sections']
-        
+
         html_sections = []
         found_app_name = None
-        app_exists_in_report = False 
+        app_exists_in_report = False
 
-        global_javascript = '''  
-        <script>  
-            function filterTable(dropdownId, tableId, statusColIndex) {  
-                var dropdown = document.getElementById(dropdownId);  
-                var filter = dropdown.value;  
-                var table = document.getElementById(tableId);  
-                var rows = table.getElementsByTagName("tr");  
+        global_javascript = '''
+        <script>
+        function filterTable(dropdownId, tableId, statusColIndex) {
+            var dropdown = document.getElementById(dropdownId);
+            var filter = dropdown.value;
+            var table = document.getElementById(tableId);
+            var rows = table.getElementsByTagName("tr");
 
-                for (var i = 1; i < rows.length; i++) {  
-                    var statusCell = rows[i].getElementsByTagName("td")[statusColIndex];  
-                    if (statusCell) {  
-                        var status = statusCell.textContent || statusCell.innerText;  
-                        if (filter === "All" || status === filter) {  
-                            rows[i].style.display = "";  
-                        } else {  
-                            rows[i].style.display = "none";  
-                        }  
-                    }  
-                }  
-            }  
-
-            document.addEventListener('DOMContentLoaded', function() {
-                var tables = document.getElementsByTagName('table');
-                for (var t = 0; t < tables.length; t++) {
-                    var table = tables[t];
-                    var ths = table.getElementsByTagName('th');
-                    var sevIndex = -1;
-                    
-                    for (var i = 0; i < ths.length; i++) {
-                        if (ths[i].innerText.toLowerCase() === 'severity') {
-                            sevIndex = i;
-                            break;
-                        }
+            for (var i = 1; i < rows.length; i++) {
+                var statusCell = rows[i].getElementsByTagName("td")[statusColIndex];
+                if (statusCell) {
+                    var status = statusCell.textContent || statusCell.innerText;
+                    if (filter === "All" || status === filter) {
+                        rows[i].style.display = "";
+                    } else {
+                        rows[i].style.display = "none";
                     }
-                    
-                    if (sevIndex > -1) {
-                        var rows = table.getElementsByTagName('tr');
-                        for (var i = 1; i < rows.length; i++) {
-                            var cell = rows[i].getElementsByTagName('td')[sevIndex];
-                            if (cell) {
-                                var val = cell.innerText.toLowerCase().trim();
-                                if (val.includes('critical')) { 
-                                    cell.style.backgroundColor = '#780000'; cell.style.color = 'white'; 
-                                } else if (val.includes('high')) { 
-                                    cell.style.backgroundColor = '#dc0000'; cell.style.color = 'white'; 
-                                } else if (val.includes('medium')) { 
-                                    cell.style.backgroundColor = '#fd8c00'; cell.style.color = 'black'; 
-                                } else if (val.includes('low')) { 
-                                    cell.style.backgroundColor = '#fdc500'; cell.style.color = 'black'; 
-                                } else if (val.includes('info')) { 
-                                    cell.style.backgroundColor = '#6395EE'; cell.style.color = 'black'; 
-                                }
+                }
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            var tables = document.getElementsByTagName('table');
+            for (var t = 0; t < tables.length; t++) {
+                var table = tables[t];
+                var ths = table.getElementsByTagName('th');
+                var sevIndex = -1;
+
+                for (var i = 0; i < ths.length; i++) {
+                    if (ths[i].innerText.toLowerCase() === 'severity') {
+                        sevIndex = i;
+                        break;
+                    }
+                }
+
+                if (sevIndex > -1) {
+                    var rows = table.getElementsByTagName('tr');
+                    for (var i = 1; i < rows.length; i++) {
+                        var cell = rows[i].getElementsByTagName('td')[sevIndex];
+                        if (cell) {
+                            var val = cell.innerText.toLowerCase().trim();
+                            if (val.includes('critical')) {
+                                cell.style.backgroundColor = '#780000'; cell.style.color = 'white';
+                            } else if (val.includes('high')) {
+                                cell.style.backgroundColor = '#dc0000'; cell.style.color = 'white';
+                            } else if (val.includes('medium')) {
+                                cell.style.backgroundColor = '#fd8c00'; cell.style.color = 'black';
+                            } else if (val.includes('low')) {
+                                cell.style.backgroundColor = '#fdc500'; cell.style.color = 'black';
+                            } else if (val.includes('info')) {
+                                cell.style.backgroundColor = '#6395EE'; cell.style.color = 'black';
                             }
                         }
                     }
                 }
-            });
-        </script>  
-        '''  
+            }
+        });
+        </script>
+        '''
 
         try:
             clean_app_code = application_code.lower()
@@ -552,7 +709,7 @@ class EmailProcessor:
                 section_title = section['title']
                 app_column = section['app_column']
                 columns_to_extract = section.get('columns_to_extract', [])
-                
+
                 custom_note_html = ""
                 if report_name == "SCA":
                     if section_title == "SLA Tracker":
@@ -568,15 +725,15 @@ class EmailProcessor:
                         df_list.append(temp_df)
                     else:
                         logging.warning(f"File not found: {source['file_path']}")
-                
+
                 if not df_list:
                     continue
 
                 df = pd.concat(df_list, ignore_index=True)
 
-                if app_column in df.columns:  
+                if app_column in df.columns:
                     base_filtered_df = df[df[app_column].astype(str).str.strip().str.lower() == clean_app_code]
-                    
+
                     if not base_filtered_df.empty:
                         app_exists_in_report = True
 
@@ -592,32 +749,32 @@ class EmailProcessor:
                             ]
                         else:
                             status_filtered_df = base_filtered_df
-                            
-                        if not status_filtered_df.empty:  
+
+                        if not status_filtered_df.empty:
                             if columns_to_extract:
                                 valid_columns = [col for col in columns_to_extract if col in status_filtered_df.columns]
-                                result = status_filtered_df[valid_columns]  
+                                result = status_filtered_df[valid_columns]
                             else:
                                 result = status_filtered_df
 
                             status_col_index = -1
                             dropdown_html = ""
-                            
+
                             if 'Status' in result.columns:
                                 status_col_index = result.columns.get_loc('Status')
-                                status_options = result['Status'].dropna().unique().tolist()  
-                                
+                                status_options = result['Status'].dropna().unique().tolist()
+
                                 dropdown_id = f"statusDropdown_{index}"
                                 table_id = f"resultTable_{index}"
-                                
+
                                 dropdown_html = f'<label for="{dropdown_id}">Filter by Status: </label>'
-                                dropdown_html += f'<select id="{dropdown_id}" onchange="filterTable(\'{dropdown_id}\', \'{table_id}\', {status_col_index})">'  
-                                dropdown_html += '<option value="All">All</option>'  
-                                for status in status_options:  
-                                    dropdown_html += f'<option value="{status}">{status}</option>'  
-                                dropdown_html += '</select><br>'  
-            
-                            table_html = result.to_html(index=False, table_id=f"resultTable_{index}")  
+                                dropdown_html += f'<select id="{dropdown_id}" onchange="filterTable(\'{dropdown_id}\', \'{table_id}\', {status_col_index})">'
+                                dropdown_html += '<option value="All">All</option>'
+                                for status in status_options:
+                                    dropdown_html += f'<option value="{status}">{status}</option>'
+                                dropdown_html += '</select><br>'
+
+                            table_html = result.to_html(index=False, table_id=f"resultTable_{index}")
                             section_html = f"<h3>{section_title}</h3>\n{dropdown_html}\n{custom_note_html}\n{table_html}\n<hr>"
                             html_sections.append(section_html)
                         else:
@@ -637,7 +794,7 @@ class EmailProcessor:
                             html_sections.append(empty_state_html)
                     else:
                         if report_name == "SCA" and section_title in ["Security", "Violations"]:
-                            empty_msg = f"<b>There are no security violations that have been observed.</b>"
+                            empty_msg = "<b>There are no security violations that have been observed.</b>"
                             empty_state_html = f'''
                             <h3>{section_title}</h3>
                             {custom_note_html}
@@ -649,7 +806,7 @@ class EmailProcessor:
                             html_sections.append(empty_state_html)
                 else:
                     logging.warning(f"'{app_column}' missing in {section_title} source files.")
-            
+
             if not app_exists_in_report:
                 empty_msg = f"<b>There is no open/exception issue observed under {report_name}.</b>"
                 html_sections = [f'''
@@ -661,14 +818,14 @@ class EmailProcessor:
                 ''']
 
             if html_sections:
-                current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  
+                current_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 output_dir = r'C:\CCB'
                 os.makedirs(output_dir, exist_ok=True)
-                
-                output_html_path = os.path.join(output_dir, f'{application_code}_{current_datetime}_{report_name}.html')  
-                
-                full_html = f'''  
-                <html>  
+
+                output_html_path = os.path.join(output_dir, f'{application_code}_{current_datetime}_{report_name}.html')
+
+                full_html = f'''
+                <html>
                 <head>
                     <title>{report_name} - Data for {application_code}</title>
                     <style>
@@ -678,37 +835,37 @@ class EmailProcessor:
                         th {{ background-color: #f2f2f2; }}
                         hr {{ border: 1px solid #ccc; margin: 30px 0; }}
                     </style>
-                </head>  
-                <body>  
-                    <h2>{report_name} - Data for {application_code}</h2>  
+                </head>
+                <body>
+                    <h2>{report_name} - Data for {application_code}</h2>
                     {global_javascript}
                     {"".join(html_sections)}
-                </body>  
-                </html>  
-                '''  
-                with open(output_html_path, 'w', encoding='utf-8') as f:  
-                    f.write(full_html)  
+                </body>
+                </html>
+                '''
+                with open(output_html_path, 'w', encoding='utf-8') as f:
+                    f.write(full_html)
 
-                logging.info(f"{report_name} saved successfully: {output_html_path}")  
-                return (output_html_path, found_app_name, app_exists_in_report) 
+                logging.info(f"{report_name} saved successfully: {output_html_path}")
+                return (output_html_path, found_app_name, app_exists_in_report)
 
             return (None, None, False)
 
         except Exception as e:
             logging.error(f"Error generating {report_name} for {application_code}: {e}")
             return (None, None, False)
-  
-    def send_email_with_attachments(self, to_email, subject, body, attachment_paths):  
-        from_email = "Infosec_VAPT@crisil.com" 
-        smtp_server = "mail.ad.crisil.com" 
-        smtp_port = 25 
 
-        try: 
-            msg = MIMEMultipart() 
-            msg['From'] = from_email 
-            msg['To'] = to_email 
-            msg['Subject'] = subject 
-            msg.attach(MIMEText(body, 'plain')) 
+    def send_email_with_attachments(self, to_email, subject, body, attachment_paths):
+        from_email = "Infosec_VAPT@crisil.com"
+        smtp_server = "mail.ad.crisil.com"
+        smtp_port = 25
+
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = from_email
+            msg['To'] = to_email
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'plain'))
 
             for path in attachment_paths:
                 if path and os.path.exists(path):
@@ -717,12 +874,12 @@ class EmailProcessor:
                     part['Content-Disposition'] = f'attachment; filename="{os.path.basename(path)}"'
                     msg.attach(part)
 
-            server = smtplib.SMTP(smtp_server, smtp_port) 
-            server.sendmail(from_email, [to_email], msg.as_string()) 
-            server.quit() 
-            logging.info(f"Successfully replied to {to_email} with reports. Subject: '{subject}'") 
-        except Exception as e: 
-            logging.error(f"Error sending email to {to_email}: {e}") 
+            server = smtplib.SMTP(smtp_server, smtp_port)
+            server.sendmail(from_email, [to_email], msg.as_string())
+            server.quit()
+            logging.info(f"Successfully replied to {to_email} with reports. Subject: '{subject}'")
+        except Exception as e:
+            logging.error(f"Error sending email to {to_email}: {e}")
 
     def get_sender_smtp_address(self, message):
         try:
@@ -736,7 +893,7 @@ class EmailProcessor:
         """Core execution logic abstracted for reusability from Automation and Manual inputs."""
         xray_html_path = self.generate_xray_report(mail_body_text, application_code)
 
-        reports = [  
+        reports = [
             {
                 "report_name": "Application VAPT",
                 "sections": [
@@ -759,7 +916,7 @@ class EmailProcessor:
                         "sources": [
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\SAST\SAST Updated Tracker.xlsx', "sheet_name": "Tracker"}
                         ],
-                        "header_row": 0,  
+                        "header_row": 0,
                         "app_column": 'Application Code',
                         "columns_to_extract": ['Application Code', 'Application Name', 'Severity', 'Vulnerability Count', 'Date of Review / Report', 'Revalidation vulnerability Count', 'Closed', 'Target Closure Date', 'Past due', 'Ageing', 'Status', 'Application SPOC']
                     }
@@ -774,9 +931,9 @@ class EmailProcessor:
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\Dashboard_v4.xlsx', "sheet_name": "SLA Tracker 2025"},
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\Dashboard_v4.xlsx', "sheet_name": "SLA Tracker 2026"}
                         ],
-                        "header_row": 0,  
+                        "header_row": 0,
                         "app_column": 'Application Code',
-                        "columns_to_extract": ['Application Code', 'Application Name', 'severity', 'Latest Start Date', 'Security','Violations','Operational','Lisenses','Count', 'SLA closure date', 'Past Due', 'SLA Email', 'Status', 'Closed', 'Application Owner']
+                        "columns_to_extract": ['Application Code', 'Application Name', 'severity', 'Latest Start Date', 'Security', 'Violations', 'Operational', 'Lisenses', 'Count', 'SLA closure date', 'Past Due', 'SLA Email', 'Status', 'Closed', 'Application Owner']
                     },
                     {
                         "title": "Violations",
@@ -784,9 +941,9 @@ class EmailProcessor:
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\2025\Violations.xlsx', "sheet_name": "Violations"},
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\2026\Violations.xlsx', "sheet_name": "Violations"}
                         ],
-                        "header_row": 0,  
+                        "header_row": 0,
                         "app_column": 'Application Code',
-                        "columns_to_extract": [] 
+                        "columns_to_extract": []
                     },
                     {
                         "title": "Security",
@@ -794,31 +951,31 @@ class EmailProcessor:
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\2025\Security.xlsx', "sheet_name": "Security"},
                             {"file_path": r'C:\Users\c-EltonC\crisil.com\Priyank Parmar - SCA_Data\2026\Security.xlsx', "sheet_name": "Security"}
                         ],
-                        "header_row": 0,  
+                        "header_row": 0,
                         "app_column": 'Application Code',
-                        "columns_to_extract": [] 
+                        "columns_to_extract": []
                     }
                 ]
             }
-        ]  
-  
+        ]
+
         generated_attachments = []
         global_app_name = None
         app_found_in_any_report = False
-        
+
         if xray_html_path:
             generated_attachments.append(xray_html_path)
             app_found_in_any_report = True
-        
-        for report_config in reports:  
-            attachment_path, extracted_name, is_present = self.filter_and_save_report(report_config, application_code)  
-            
+
+        for report_config in reports:
+            attachment_path, extracted_name, is_present = self.filter_and_save_report(report_config, application_code)
+
             if attachment_path:
                 generated_attachments.append(attachment_path)
-                
+
             if extracted_name and not global_app_name:
                 global_app_name = extracted_name
-                
+
             if is_present:
                 app_found_in_any_report = True
 
@@ -827,29 +984,29 @@ class EmailProcessor:
                 email_subject = f"RE: {application_code} - {global_app_name} - Requested Reports"
             else:
                 email_subject = f"RE: {application_code} - Requested Reports"
-                
+
             if sender_email:
-                self.send_email_with_attachments( 
-                    to_email=sender_email, 
-                    subject=email_subject, 
+                self.send_email_with_attachments(
+                    to_email=sender_email,
+                    subject=email_subject,
                     body=f"Hello,\n\nPlease find the requested security reports for {application_code} attached.\n\nNote: Only findings with an 'Open' or 'Exception' related status are included. If an assessment returns zero such findings, the report will explicitly indicate that it is clear.\n\nRegards,\nInfosec Team",
                     attachment_paths=generated_attachments
-                ) 
+                )
             self.log_to_csv(entry_id, sender_email, raw_subject, True, "Success")
         else:
             logging.info(f"Code '{application_code}' not found in any trackers or Xray URLs. Triggering Out of Scope email.")
             email_subject = f"RE: {application_code} - Application Not in Scope"
             body = f"Hello,\n\nThe mentioned application code ({application_code}) is not present in any of the activities (VAPT, SAST & SCA). Application might not be in the Scope. Kindly reach out to Infosec_VAPT.\n\nRegards,\nInfosec Team"
-            
+
             if sender_email:
                 self.send_email_with_attachments(
-                    to_email=sender_email, 
-                    subject=email_subject, 
+                    to_email=sender_email,
+                    subject=email_subject,
                     body=body,
                     attachment_paths=[]
                 )
             self.log_to_csv(entry_id, sender_email, raw_subject, False, "Out of Scope")
-            
+
         for path in generated_attachments:
             try:
                 if os.path.exists(path):
@@ -857,37 +1014,37 @@ class EmailProcessor:
             except Exception as e:
                 logging.warning(f"Could not delete temp file {path}: {e}")
 
-    def read_outlook_inbox(self):  
-        try:  
-            outlook = win32com.client.Dispatch("Outlook.Application")  
-            namespace = outlook.GetNamespace("MAPI")  
-            inbox = namespace.GetDefaultFolder(6)  
-  
-            messages = inbox.Items.Restrict("[UnRead] = True")  
-            messages.Sort('ReceivedTime', True)  
-  
-            for message in messages:  
+    def read_outlook_inbox(self):
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            namespace = outlook.GetNamespace("MAPI")
+            inbox = namespace.GetDefaultFolder(6)
+
+            messages = inbox.Items.Restrict("[UnRead] = True")
+            messages.Sort('ReceivedTime', True)
+
+            for message in messages:
                 entry_id = message.EntryID
 
                 if entry_id in self.processed_entry_ids:
                     continue
-                
-                message_dt = datetime.fromtimestamp(message.ReceivedTime.timestamp(), tz=pytz.UTC)  
+
+                message_dt = datetime.fromtimestamp(message.ReceivedTime.timestamp(), tz=pytz.UTC)
 
                 if message_dt < self.startup_time:
                     continue
-                
+
                 raw_subject = message.Subject
                 application_code = self.extract_app_code(raw_subject)
                 sender_email = self.get_sender_smtp_address(message)
 
                 if application_code:
-                    logging.info(f"Processing request for Code: '{application_code}' from {sender_email}")  
-                    
+                    logging.info(f"Processing request for Code: '{application_code}' from {sender_email}")
+
                     mail_body_text = message.Body
                     if hasattr(message, "HTMLBody"):
                         mail_body_text += " \n " + str(message.HTMLBody)
-                        
+
                     self.process_core_logic(application_code, mail_body_text, sender_email, entry_id, raw_subject)
 
                 else:
@@ -897,65 +1054,66 @@ class EmailProcessor:
                 message.UnRead = False
                 self.processed_entry_ids.add(entry_id)
 
-        except Exception as e:  
-            logging.error(f"An error occurred while reading Outlook: {e}")  
-            
+        except Exception as e:
+            logging.error(f"An error occurred while reading Outlook: {e}")
+
     def process_manual_excel(self, excel_path):
         if not os.path.exists(excel_path):
             logging.error(f"Excel file not found at path: {excel_path}")
             return
-            
+
         try:
             df = pd.read_excel(excel_path)
-            
+
             if 'Email Subject' not in df.columns or 'Email Body' not in df.columns:
                 logging.error("The Excel file must contain 'Email Subject' and 'Email Body' columns.")
                 return
-                
+
             for index, row in df.iterrows():
                 raw_subject = str(row['Email Subject'])
                 mail_body_text = str(row['Email Body'])
-                sender_email = str(row.get('Sender Email', ''))  
-                
+                sender_email = str(row.get('Sender Email', ''))
+
                 if sender_email.lower() == 'nan' or not sender_email.strip():
                     sender_email = None
-                    
+
                 application_code = self.extract_app_code(raw_subject)
                 entry_id = f"MANUAL_EXCEL_ROW_{index + 1}"
-                
+
                 if application_code:
                     logging.info(f"Processing Manual row {index + 1} for Code: '{application_code}'")
                     self.process_core_logic(application_code, mail_body_text, sender_email, entry_id, raw_subject)
                 else:
                     logging.info(f"Row {index + 1} Ignored: Subject '{raw_subject}' does not strictly match 'CRIXXXXX' format.")
                     self.log_to_csv(entry_id, sender_email if sender_email else "N/A", raw_subject, False, "Ignored - Invalid Subject Format")
-                    
+
         except Exception as e:
             logging.error(f"An error occurred while reading the Excel file: {e}")
 
-if __name__ == "__main__":  
+
+if __name__ == "__main__":
     print("Select Execution Mode:")
     print("1. Manual Email Reporting (Read from Excel)")
     print("2. Email Automation (Monitor Outlook Inbox)")
-    
+
     choice = input("Enter choice (1 or 2): ").strip()
-    
+
     processor = EmailProcessor()
-    
+
     if choice == '1':
         excel_path = input("Enter the full path to the Excel file: ").strip()
         excel_path = excel_path.strip('"').strip("'")
-        
+
         logging.info(f"Starting Manual Email Reporting using file: {excel_path}")
         processor.process_manual_excel(excel_path)
         logging.info("Manual processing loop completed.")
-        
+
     elif choice == '2':
         logging.info("Starting email monitoring loop. Press Ctrl+C to stop.")
         try:
-            while True:  
-                processor.read_outlook_inbox()  
-                time.sleep(5) 
+            while True:
+                processor.read_outlook_inbox()
+                time.sleep(5)
         except KeyboardInterrupt:
             logging.info("Script manually terminated.")
     else:
